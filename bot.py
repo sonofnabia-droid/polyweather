@@ -1,23 +1,38 @@
-
 import os
-from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-load_dotenv()
+# ────────────────────────────────────────────────
+#               CONFIGURAÇÃO
+# ────────────────────────────────────────────────
 
-# ==================== CONFIGURAÇÃO ====================
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN")
+
+# Debug temporário (remove depois de confirmar que funciona)
+print("DEBUG - Variáveis de ambiente relevantes:")
+for key in sorted(os.environ):
+    if "TOKEN" in key.upper() or "BOT" in key.upper():
+        value = os.environ[key]
+        print(f"  {key} → {value[:10]}{'...' if len(value) > 10 else ''} (len={len(value)})")
+print(f"TOKEN final = {TOKEN[:10]}... (len={len(TOKEN) if TOKEN else 0})")
+
 if not TOKEN:
-    raise ValueError("BOT_TOKEN não encontrado! Define na Railway.")
+    raise ValueError(
+        "BOT_TOKEN não encontrado nas variáveis de ambiente.\n"
+        "No Railway → vai a Variables → adiciona exatamente: BOT_TOKEN\n"
+        "Valor: 8711370296:AAFP3_cnhDt6H8gUN-1-YaNL754BUm6kVYs"
+    )
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-# Lista para guardar os chat_id dos usuários (para enviares notificações depois)
-usuarios = []  # ← aqui vamos guardar quem interagiu com o bot
+# Lista de chat_ids para enviar notificações depois
+usuarios = []
 
 
-# ==================== MENU PRINCIPAL ====================
+# ────────────────────────────────────────────────
+#               MENU PRINCIPAL
+# ────────────────────────────────────────────────
+
 def criar_menu_principal():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -29,19 +44,20 @@ def criar_menu_principal():
     return markup
 
 
-# ==================== COMANDOS ====================
+# ────────────────────────────────────────────────
+#               COMANDOS
+# ────────────────────────────────────────────────
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     chat_id = message.chat.id
-    
-    # Guarda o usuário para poder enviar notificações depois
     if chat_id not in usuarios:
         usuarios.append(chat_id)
-        print(f"Novo usuário adicionado: {chat_id}")
-    
+        print(f"Novo usuário: {chat_id}")
+
     bot.send_message(
         chat_id,
-        "👋 Olá! Bem-vindo ao bot.\n\nEscolhe uma opção abaixo:",
+        "👋 Olá! Bem-vindo ao bot.\n\nEscolhe uma opção:",
         reply_markup=criar_menu_principal()
     )
 
@@ -55,39 +71,47 @@ def cmd_menu(message):
     )
 
 
-# ==================== CALLBACKS (botões do menu) ====================
+# ────────────────────────────────────────────────
+#               CALLBACKS (botões)
+# ────────────────────────────────────────────────
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     if call.data == "status":
-        bot.answer_callback_query(call.id, "Status atual: OK ✅")
-        bot.send_message(call.message.chat.id, "✅ Tudo a funcionar normalmente!")
+        bot.answer_callback_query(call.id, "Status: OK ✅")
+        bot.send_message(call.message.chat.id, "✅ Tudo a funcionar!")
     
     elif call.data == "sobre":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Este bot foi criado para te enviar notificações automáticas.")
+        bot.send_message(call.message.chat.id, "Bot de notificações automáticas.")
     
     elif call.data == "config":
         bot.answer_callback_query(call.id, "Em breve...")
-        bot.send_message(call.message.chat.id, "⚙️ Configurações em desenvolvimento.")
+        bot.send_message(call.message.chat.id, "⚙️ Configurações (em desenvolvimento)")
     
     elif call.data == "ajuda":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Para receber notificações, basta manter o chat aberto.\n\nQualquer dúvida, escreve /ajuda.")
+        bot.send_message(call.message.chat.id, "Mantém o chat aberto para receber notificações.")
 
 
-# ==================== FUNÇÃO PARA ENVIAR NOTIFICAÇÕES (usarás mais tarde) ====================
-def enviar_notificacao_para_todos(mensagem: str):
-    """Chama esta função quando o evento acontecer (mais tarde eu implemento a parte dos eventos)"""
-    for chat_id in usuarios[:]:  # cópia para evitar problemas
+# ────────────────────────────────────────────────
+#               FUNÇÃO DE NOTIFICAÇÃO (para usar mais tarde)
+# ────────────────────────────────────────────────
+
+def enviar_notificacao_para_todos(texto: str):
+    for chat_id in usuarios[:]:
         try:
-            bot.send_message(chat_id, mensagem, parse_mode="HTML")
-        except:
-            # remove usuário que bloqueou o bot ou apagou o chat
+            bot.send_message(chat_id, texto, parse_mode="HTML")
+        except Exception as e:
+            print(f"Erro ao enviar para {chat_id}: {e}")
             if chat_id in usuarios:
                 usuarios.remove(chat_id)
 
 
-# ==================== POLLING (roda 24/7) ====================
+# ────────────────────────────────────────────────
+#               INÍCIO
+# ────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("🤖 Bot iniciado com sucesso!")
-    bot.infinity_polling(none_stop=True)
+    print("🤖 Bot iniciado")
+    bot.infinity_polling(none_stop=True, interval=0, timeout=30)
