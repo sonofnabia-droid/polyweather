@@ -8,19 +8,21 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
-# Debug temporário (remove depois de confirmar que funciona)
+# Debug seguro (não quebra se TOKEN for None)
 print("DEBUG - Variáveis de ambiente relevantes:")
 for key in sorted(os.environ):
     if "TOKEN" in key.upper() or "BOT" in key.upper():
         value = os.environ[key]
-        print(f"  {key} → {value[:10]}{'...' if len(value) > 10 else ''} (len={len(value)})")
-print(f"TOKEN final = {TOKEN[:10]}... (len={len(TOKEN) if TOKEN else 0})")
+        preview = value[:10] + "..." if value else "None"
+        print(f"  {key} → {preview} (len={len(value) if value else 0})")
+
+print(f"TOKEN final = {TOKEN[:10]+'...' if TOKEN else 'None'} (len={len(TOKEN) if TOKEN else 0})")
 
 if not TOKEN:
     raise ValueError(
         "BOT_TOKEN não encontrado nas variáveis de ambiente.\n"
         "No Railway → vai a Variables → adiciona exatamente: BOT_TOKEN\n"
-        "Valor: 8711370296:AAFP3_cnhDt6H8gUN-1-YaNL754BUm6kVYs"
+        "Valor: <o token do teu bot>"
     )
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -95,7 +97,7 @@ def callback_handler(call):
 
 
 # ────────────────────────────────────────────────
-#               FUNÇÃO DE NOTIFICAÇÃO (para usar mais tarde)
+#               FUNÇÃO DE NOTIFICAÇÃO
 # ────────────────────────────────────────────────
 
 def enviar_notificacao_para_todos(texto: str):
