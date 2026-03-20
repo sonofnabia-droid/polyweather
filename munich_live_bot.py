@@ -1,9 +1,3 @@
-"""
-MUNICH LIVE BOT - RAILWAY EDITION
-Uso no Railway (Start Command): 
-python munich_live_bot.py --railway --real --bankroll 100 --threshold 0.82
-"""
-
 import argparse
 import json
 import os
@@ -18,106 +12,122 @@ from datetime import datetime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# Configurações de Timezone
-_BERLIN = ZoneInfo("Europe/Berlin")
-_LOCAL  = ZoneInfo("Europe/Lisbon")
-
 # --- SUPRESSÃO DE WARNINGS ---
 warnings.filterwarnings("ignore")
 
-# --- CONFIGURAÇÕES DE PATH ---
+# --- CONFIGURAÇÕES DE TIMEZONE ---
+_BERLIN = ZoneInfo("Europe/Berlin")
+_LOCAL  = ZoneInfo("Europe/Lisbon")
+
+# --- CONFIGURAÇÕES DE PATH E AMBIENTE ---
 MODEL_LGB    = Path("munich_peak_model/lgbm_peak.pkl")
 MODEL_CONFIG = Path("munich_peak_model/peak_model_config.json")
 WU_API_KEY   = os.environ.get("WU_API_KEY", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "") # Adicione no Railway
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ANSI COLORS para o Dashboard
+R="\033[0m"; B="\033[1m"; DIM="\033[2m"
+C={"green":"\033[92m","yellow":"\033[93m","orange":"\033[33m","red":"\033[91m","cyan":"\033[96m","gray":"\033[90m"}
 
 # ══════════════════════════════════════════════════════
-#  FUNÇÕES DE APOIO (Lógica do Modelo e Clima)
+#  CLASSE TELEGRAM (Simples)
 # ══════════════════════════════════════════════════════
-
-def get_berlin_now():
-    return datetime.now(tz=_BERLIN)
-
-def ceil_slot(hour: int, minute: int):
-    if minute < 30: return (hour, 30)
-    else: return (hour + 1, 0)
-
-# [Aqui entrariam as funções de fetch_wu_day_eddm e build_features do seu código original]
-# Mantive a estrutura essencial para o bot rodar sem interrupção.
-
-def predict_peak(model, current_data, feat_cols):
-    """Simula a predição baseada no modelo carregado"""
-    try:
-        # X = pd.DataFrame([current_data])[feat_cols]
-        # return float(model.predict(X)[0])
-        return 0.55 # Placeholder para exemplo
-    except:
-        return 0.0
+class TG:
+    @staticmethod
+    def send(msg):
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+        except: pass
 
 # ══════════════════════════════════════════════════════
-#  LOGICA DE EXECUÇÃO (MAIN)
+#  FUNÇÕES DE DASHBOARD ASCII
 # ══════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(description="Munich Live Bot")
-    parser.add_argument("--railway", action="store_true", help="Modo non-interactive")
-    parser.add_argument("--real", action="store_true", help="Dinheiro real (CLOB)")
-    parser.add_argument("--paper", action="store_true", default=True, help="Simulação")
-    parser.add_argument("--threshold", type=float, default=0.80, help="P(pico) para apostar")
-    parser.add_argument("--bankroll", type=float, default=50.0, help="USDC disponível")
+def draw_chart(series_today, signals):
+    """Gera o gráfico de temperatura em ASCII para o log do Railway"""
+    lines = []
+    slots = [(h, m) for h in range(6, 21) for m in (0, 30)]
+    temps = [series_today.get(s) for s in slots]
+    avail = [t for t in temps if t is not None]
+    if not avail: return ["  (Aguardando dados para gráfico...)"]
     
+    t_min, t_max = min(avail) - 0.5, max(avail) + 0.5
+    t_rng = max(t_max - t_min, 1.0)
+    chart_h = 8
+    
+    col_w = 2
+    grid = [[" "] * (len(slots) * col_w + 5) for _ in range(chart_h)]
+    
+    for row in range(chart_h):
+        t_val = t_max - (row / (chart_h - 1)) * t_rng
+        grid[row][0:4] = list(f"{int(round(t_val)):>2}° ")
+    
+    for si, (slot, temp) in enumerate(zip(slots, temps)):
+        if temp is None: continue
+        row = int((1 - (temp - t_min) / t_rng) * (chart_h - 1))
+        col = 4 + si * col_w
+        p = signals.get(slot[0], 0)
+        color = C["green"] if p > 0.8 else C["yellow"] if p > 0.5 else C["gray"]
+        grid[row][col] = f"{color}█{R}"
+
+    return ["".join(row) for row in grid]
+
+# ══════════════════════════════════════════════════════
+#  LOGICA PRINCIPAL
+# ══════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--railway", action="store_true")
+    parser.add_argument("--real", action="store_true")
+    parser.add_argument("--threshold", type=float, default=0.85)
+    parser.add_argument("--bankroll", type=float, default=50.0)
     args = parser.parse_args()
 
-    # Cabeçalho de Inicialização
-    print("="*50)
-    print(f" MUNICH LIVE BOT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f" MODO: {'REAL (DINHEIRO)' if args.real else 'PAPER (SIMULADO)'}")
-    print(f" THRESHOLD: {args.threshold} | BANKROLL: ${args.bankroll}")
-    print("="*50)
+    # Bootstrap inicial
+    print(f"{B}{C['cyan']}=== MUNICH LIVE BOT OPERACIONAL ==={R}")
+    TG.send("🚀 *Bot Munich Iniciado no Railway*")
 
-    # Verificação de Variáveis de Ambiente
-    if not WU_API_KEY:
-        print("CRITICAL: WU_API_KEY não encontrada. Encerrando.")
-        sys.exit(1)
-    
-    if args.real and not os.environ.get("POLY_PRIVATE_KEY"):
-        print("CRITICAL: Modo REAL exige POLY_PRIVATE_KEY. Encerrando.")
-        sys.exit(1)
+    # Dicionários de estado (Simulando persistência na sessão)
+    series_today = {} 
+    signals_history = {}
 
-    # Carregar Modelo
-    try:
-        # model = joblib.load(MODEL_LGB)
-        print("✓ Modelo carregado com sucesso.")
-    except Exception as e:
-        print(f"AVISO: Erro ao carregar modelo ({e}). Usando modo heurístico.")
-
-    # LOOP PRINCIPAL
-    print("Iniciando monitoramento...")
-    
     while True:
-        now_berlin = get_berlin_now()
+        now_berlin = datetime.now(tz=_BERLIN)
+        h, m = now_berlin.hour, now_berlin.minute
         
-        # Só opera entre 07:00 e 20:00 de Berlim
-        if 7 <= now_berlin.hour <= 20:
-            print(f"[{now_berlin.strftime('%H:%M')}] Verificando clima e mercado...")
-            
-            # 1. Fetch data from Wunderground
-            # 2. Update slots_so_far
-            # 3. Predict P(pico)
-            p_pico = 0.42 # Exemplo
-            
-            print(f" > P(pico ocorrido): {p_pico:.2f}")
+        # 1. Simulação de coleta de dados (Substitua pela sua função WU real)
+        # temp_atual = fetch_wu_latest(...)
+        temp_atual = 18 + (h % 5) # Exemplo fictício
+        slot_key = (h, 30 if m >= 30 else 0)
+        series_today[slot_key] = temp_atual
+        
+        # 2. Predição (Substitua pela chamada do modelo LightGBM)
+        p_pico = 0.42 + (h/50) # Exemplo fictício que sobe com o dia
+        signals_history[h] = p_pico
 
-            if p_pico >= args.threshold:
-                print(f"!!! SINAL DETECTADO ({p_pico:.2f} >= {args.threshold}) !!!")
-                # Executar ordem no Polymarket aqui
-            
-        else:
-            print(f"[{now_berlin.strftime('%H:%M')}] Fora do horário de pico em Munique. Dormindo 30m.")
-            time.sleep(1800)
-            continue
+        # 3. RENDERIZAÇÃO DO DASHBOARD NO LOG
+        os.system('clear' if os.name == 'posix' else 'cls') # Tenta limpar log
+        print("-" * 50)
+        print(f" HORA: {now_berlin.strftime('%H:%M:%S')} | MODO: {'REAL' if args.real else 'PAPER'}")
+        print(f" TEMP ATUAL: {temp_atual}°C | P(PICO): {p_pico:.2%}")
+        print("-" * 50)
+        
+        for line in draw_chart(series_today, signals_history):
+            print(line)
+        
+        print(f"{DIM}Eixo X: 06h . . . . . . . . 20h{R}")
+        print("-" * 50)
 
-        # Espera 1 minuto para a próxima leitura
-        sys.stdout.flush() # Garante que o log apareça no Railway
+        # 4. LÓGICA DE TRADING E TELEGRAM
+        if p_pico >= args.threshold:
+            msg = f"⚠️ *SINAL ALTO:* P({p_pico:.2%}) atingiu threshold {args.threshold}!"
+            print(f"{C['orange']}{msg}{R}")
+            TG.send(msg)
+            # Executar Ordem Real aqui se args.real...
+
+        sys.stdout.flush()
         time.sleep(60)
 
 if __name__ == "__main__":
