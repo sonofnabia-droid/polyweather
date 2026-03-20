@@ -12,17 +12,18 @@ from zoneinfo import ZoneInfo
 warnings.filterwarnings("ignore")
 _BERLIN = ZoneInfo("Europe/Berlin")
 
-# Variáveis de Ambiente
+# Variáveis de Ambiente (Railway)
 WU_API_KEY = os.environ.get("WU_API_KEY", "")
+POLY_PRIVATE_KEY = os.environ.get("POLY_PRIVATE_KEY", "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Cores ANSI para Log
+# Cores ANSI para o Log do Railway
 G, Y, R, C, W = "\033[92m", "\033[93m", "\033[91m", "\033[96m", "\033[0m"
 B, DIM = "\033[1m", "\033[2m"
 
 # ══════════════════════════════════════════════════════
-#  SISTEMA DE NOTIFICAÇÃO
+#  SISTEMA DE NOTIFICAÇÃO (TELEGRAM RICO)
 # ══════════════════════════════════════════════════════
 class TG:
     @staticmethod
@@ -36,76 +37,85 @@ class TG:
                 "text": msg, 
                 "parse_mode": "Markdown"
             }, timeout=10)
-            if res.status_code != 200:
-                print(f"❌ {R}Telegram Error {res.status_code}: {res.text}{W}")
-        except Exception as e:
-            print(f"❌ {R}Telegram Conn Error: {e}{W}")
+        except:
+            pass
 
 # ══════════════════════════════════════════════════════
-#  FUNÇÕES AUXILIARES
+#  LOGICA DE EXECUÇÃO
 # ══════════════════════════════════════════════════════
-def draw_ascii(series):
-    """Mini dashboard para modo local."""
-    if not series: return ["  [Aguardando dados...]"]
-    items = list(series.values())
-    t_min, t_max = min(items)-1, max(items)+1
-    return [f"Max Temp: {max(items)}°C", f"Min Temp: {min(items)}°C"]
 
-# ══════════════════════════════════════════════════════
-#  LOOP PRINCIPAL
-# ══════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--railway", action="store_true")
     parser.add_argument("--real", action="store_true")
     parser.add_argument("--threshold", type=float, default=0.85)
+    parser.add_argument("--bankroll", type=float, default=100.0)
     args = parser.parse_args()
 
     mode_label = "REAL" if args.real else "PAPER"
-    print(f"[{datetime.now().strftime('%T')}] {C}Iniciando Bot Munich...{W}")
     
-    # Envio de Boas-vindas
-    TG.send(f"🚀 *Munich Bot Online*\nModo: `{mode_label}`\nThreshold: `{args.threshold}`")
-
-    series_today = {}
+    # Mensagem de Inicialização
+    print(f"[{datetime.now().strftime('%T')}] {C}Bot Munich Ativo | Modo: {mode_label}{W}")
+    TG.send(f"🚀 *Munich Bot Online*\n━━━━━━━━━━━━━━\nModo: `{mode_label}`\nAlvo: `{args.threshold}`\nBankroll: `${args.bankroll}`")
 
     try:
         while True:
             now = datetime.now(tz=_BERLIN)
             
-            # --- SIMULAÇÃO DE DADOS (Substitua pela lógica real) ---
-            temp_atual = 19.5 
-            p_pico = 0.82
-            bid, ask = 0.44, 0.49
-            bracket = "19-20°C"
+            # --- 1. DADOS (SUBSTITUA PELAS SUAS FUNÇÕES REAIS) ---
+            temp_atual = 20.2      # vindo de fetch_wu_latest()
+            p_pico = 0.88          # vindo de predict_p()
+            bid, ask = 0.48, 0.53  # vindo de fetch_market()
+            bracket = "20-21°C"    # identificação do mercado
             
-            slot = (now.hour, 30 if now.minute >= 30 else 0)
-            series_today[slot] = temp_atual
+            # --- 2. CÁLCULOS DE TRADING ---
+            edge = p_pico - ask
+            ev = edge / ask if ask > 0 else 0
+            
+            # --- 3. LOG NO RAILWAY (Minimalista + Inteligente) ---
+            # Cor verde no P se o EV for positivo (P > Ask)
+            p_color = G if edge > 0 else W
+            status_tag = f"{G}[BET]{W}" if args.real and edge > 0.05 else f"{DIM}[OBS]{W}"
+            
+            log_line = (
+                f"[{now.strftime('%H:%M:%S')}] "
+                f"{B}{temp_atual:>4.1f}°{W} | "
+                f"P:{p_color}{p_pico:>5.1%}{W} | "
+                f"MKT:{G}{int(bid*100):>2}{W}/{R}{int(ask*100):<2}{W}¢ | "
+                f"EV:{ev:>+5.1%} | {status_tag}"
+            )
+            print(log_line)
 
-            if args.railway:
-                # Log Minimalista e Rico (Railway)
-                p_color = G if p_pico > ask else W
-                print(f"[{now.strftime('%H:%M:%S')}] {B}{temp_atual}°{W} | "
-                      f"P:{p_color}{p_pico:.1%}{W} | {C}{bracket}{W} | "
-                      f"CLOB:{G}{int(bid*100)}{W}/{R}{int(ask*100)}{W}¢")
-            else:
-                # Log Expandido (Local)
-                print(f"\n--- {mode_label} DASHBOARD ---")
-                print(f"Hora: {now.strftime('%T')} | Temp: {temp_atual}°C")
-                print(f"Probabilidade: {p_pico:.1%} | Alvo: {args.threshold}")
-
-            # Lógica de Alerta
-            if p_pico >= args.threshold:
-                TG.send(f"⚠️ *Alerta de Sinal*\nP(pico): {p_pico:.1%}\nAsk: {ask*100}¢")
+            # --- 4. TELEGRAM (Ticket Detalhado) ---
+            # Envia alerta se P atingir threshold ou se houver oportunidade clara
+            if p_pico >= args.threshold and edge > 0:
+                ticket = (
+                    f"⚠️ *OPORTUNIDADE DETECTADA*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🌡️ *Temp Atual:* `{temp_atual}°C`\n"
+                    f"🎯 *Mercado:* `{bracket}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 *Modelo P:* `{p_pico:.1%}`\n"
+                    f"💰 *Preço Buy:* `{ask*100:.1f}¢`\n"
+                    f"📈 *Expected Value:* `+{ev:.1%}`\n"
+                    f"⚖️ *Edge:* `+{edge*100:.1f}¢`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🤖 *Ação:* `{'EXECUTANDO ORDEM' if args.real else 'PAPER SIGNAL'}`\n"
+                    f"🕒 `{now.strftime('%H:%M:%S')} Munique`"
+                )
+                TG.send(ticket)
+                
+                if args.real:
+                    # Chame sua função de order_execution aqui
+                    pass
 
             sys.stdout.flush()
             time.sleep(60)
 
     except KeyboardInterrupt:
-        print(f"\n{Y}Bot interrompido pelo usuário.{W}")
         sys.exit(0)
     except Exception as e:
-        print(f"\n{R}ERRO FATAL: {e}{W}")
+        print(f"{R}Erro Fatal: {e}{W}")
         TG.send(f"❌ *Bot Munich Crashou!*\nErro: `{e}`")
         sys.exit(1)
 
