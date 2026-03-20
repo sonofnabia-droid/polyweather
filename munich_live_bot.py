@@ -8,28 +8,8 @@ from zoneinfo import ZoneInfo
 
 # --- CONFIGURAÇÕES ---
 _BERLIN = ZoneInfo("Europe/Berlin")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip() # .strip() remove espaços acidentais
-
-# Cores
 G, Y, R, C, W = "\033[92m", "\033[93m", "\033[91m", "\033[96m", "\033[0m"
-
-class TG:
-    @staticmethod
-    def send(msg):
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            res = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID, 
-                "text": msg, 
-                "parse_mode": "Markdown"
-            }, timeout=10)
-            if res.status_code != 200:
-                print(f"❌ {R}Erro Telegram {res.status_code}: Verifique se deu /start no bot ou se o ID {TELEGRAM_CHAT_ID} está correto.{W}")
-        except:
-            pass
+DIM = "\033[2m"
 
 def main():
     parser = argparse.ArgumentParser()
@@ -38,30 +18,43 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.85)
     args = parser.parse_args()
 
-    mode_label = "REAL" if args.real else "PAPER"
-    
-    # Notificação de Arranque
-    print(f"[{datetime.now().strftime('%T')}] {C}Bot Online | Modo: {mode_label} | Railway: {args.railway}{W}")
-    TG.send(f"🚀 *Munich Bot Online*\nModo: `{mode_label}`\nRailway: `{args.railway}`")
+    mode_label = f"{G}REAL{W}" if args.real else f"{Y}PAPER{W}"
+    print(f"[{datetime.now().strftime('%T')}] {C}Bot Smart-Log Ativo | Modo: {mode_label}{W}")
 
     while True:
         now = datetime.now(tz=_BERLIN)
         
-        # --- Lógica de Dados Real aqui ---
-        temp_atual = 20 
-        p_pico = 0.82 
+        # --- DADOS SIMULADOS (Substitua pela lógica de mercado real) ---
+        temp_atual = 20.4
+        p_pico = 0.82
+        
+        # Informações do Mercado (Exemplo vindo do seu fetch_market/clob)
+        bracket_label = "20-21°C"
+        bid = 0.48
+        ask = 0.52
+        spread = ask - bid
+        
+        # Lógica de Cor para Probabilidade vs Preço
+        # Se P(pico) > Ask, temos EV positivo
+        ev_color = G if p_pico > ask else W
+        
+        # LOG SMART-MINIMALISTA (Tudo em uma linha informativa)
+        # Formato: [HORA] TEMP | P(PICO) | BRACKET | BID/ASK | SPREAD
+        log_line = (
+            f"[{now.strftime('%H:%M:%S')}] "
+            f"{B}{temp_atual}°C{W} | "
+            f"P:{ev_color}{p_pico:.1%}{W} | "
+            f"{C}{bracket_label}{W} | "
+            f"CLOB:{G}{bid*100:>2.0f}{W}/{R}{ask*100:<2.0f}{W}¢ | "
+            f"Spr:{DIM}{spread*100:.1f}¢{W}"
+        )
+        
+        print(log_line)
 
-        if args.railway:
-            # LOG CLEAN (Para Railway)
-            status_color = G if p_pico >= args.threshold else W
-            print(f"[{now.strftime('%H:%M:%S')}] Temp: {temp_atual}°C | P(pico): {status_color}{p_pico:.1%}{W} | Mode: {mode_label}")
-        else:
-            # DASHBOARD (Opcional Local)
-            print(f"\n--- MUNICH {mode_label} ---")
-            print(f"P(pico): {p_pico:.1%} | Alvo: {args.threshold}")
-
+        # Disparo de Telegram se houver sinal
         if p_pico >= args.threshold:
-            TG.send(f"⚠️ *Alerta Munich*\nP(pico): {p_pico:.1%} | Temp: {temp_atual}°C")
+            # Recomendo enviar um log mais rico no Telegram já que lá não polui o terminal
+            pass
 
         sys.stdout.flush()
         time.sleep(60)
