@@ -1,1 +1,1 @@
-worker: munich_live.py
+worker: munich_live_bot.py
