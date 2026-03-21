@@ -5,7 +5,7 @@ from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 # --- CONFIGURAÇÕES DE TIMEZONE ---
-_BERLIN = ZoneInfo("Europe/Berlin") 
+_BERLIN = ZoneInfo("Europe/Berlin")
 
 def berlin_now():
     return datetime.now(tz=_BERLIN)
