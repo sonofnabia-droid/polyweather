@@ -1,0 +1,7 @@
+[tools]
+# Usamos a 3.12.9 por ser a mais estável para LightGBM e Joblib em 2026
+python = "3.12.9"
+
+[settings]
+# Garante que o mise instala as dependências antes de correr o bot
+autoinstall = true
