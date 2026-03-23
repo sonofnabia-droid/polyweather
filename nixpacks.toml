@@ -1,3 +1,0 @@
-[phases.setup]
-nixPkgs = ["...", "libgomp"] # Adiciona libgomp à lista
-aptPkgs = ["libgomp1"]
