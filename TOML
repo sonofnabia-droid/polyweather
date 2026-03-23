@@ -1,7 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[deploy]
-startCommand = "python munich_live_bot.py --railway"
-restartPolicyType = "always"
-restartPolicyMaxRetries = 10
