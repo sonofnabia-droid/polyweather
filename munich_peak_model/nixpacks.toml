@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["...", "libgomp"]
-
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[phases.build]
-aptPkgs = ["libgomp1"]
