@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -328,16 +329,22 @@ class ClobClient:
         size_usdc:     float,
         bracket_label: str  = "",
         market_slug:   str  = "",
+        order_type:    str  = "FOK",
     ) -> OrderResult:
         """
         Comprar YES num bracket.
 
         Parâmetros
         ----------
-        token_id    : CLOB token ID do outcome YES
-        price       : preço limite em USDC por share (0–1), tipicamente o ask
-        size_usdc   : montante em USDC a gastar (não shares)
+        token_id      : CLOB token ID do outcome YES
+        price         : preço limite em USDC por share (0–1), tipicamente o ask
+        size_usdc     : montante em USDC a gastar (não shares)
         bracket_label : label do bracket para logging
+        order_type    : "FOK" (Fill-or-Kill, comportamento de market order — default)
+                        "GTC" (Good-Till-Cancelled, fica no book se não encher)
+
+        FOK ao ask = market order: preenche imediatamente ou cancela.
+        GTC ao ask = limit order: pode ficar pendente no order book.
 
         Devolve OrderResult com resultado da operação.
         """
@@ -368,7 +375,15 @@ class ClobClient:
                 timestamp=ts,
             )
 
-        shares = round(size_usdc / price, 4)
+        # Para ordens FOK (market buy) o Polymarket exige:
+        #   makerAmount (USDC)   = shares × price   → máx 2 casas decimais
+        #   takerAmount (shares)                     → máx 4 casas decimais
+        # Com price = P/100 e GCD(P,100)=1 (ex: 0.49), a única solução é shares inteiro.
+        # Usamos floor para nunca gastar mais do que o pedido.
+        if order_type.upper() == "FOK":
+            shares = math.floor(size_usdc / price)          # inteiro → maker sempre limpo
+        else:
+            shares = round(size_usdc / price, 4)            # GTC: 4 casas decimais
 
         # ── PAPER MODE ────────────────────────────────
         if self.mode == TradingMode.PAPER:
@@ -407,6 +422,8 @@ class ClobClient:
 
             # ⚠️  Usa string "BUY"/"SELL" diretamente em vez de importar
             #     a constante BUY do order_builder — mais robusto entre versões
+            _otype = OrderType.FOK if order_type.upper() == "FOK" else OrderType.GTC
+
             order_args = OrderArgs(
                 token_id = token_id,
                 price    = round(price, 4),
@@ -414,13 +431,20 @@ class ClobClient:
                 side     = "BUY",
             )
             signed_order = self._client.create_order(order_args)
-            response     = self._client.post_order(signed_order, OrderType.GTC)
+            response     = self._client.post_order(signed_order, _otype)
 
             order_id = response.get("orderID") or response.get("id") or "?"
             status   = response.get("status", "unknown")
 
+            # FOK: só "matched" é sucesso (canceled = não encheu)
+            # GTC: "matched"/"live"/"delayed" são todos estados válidos
+            if order_type.upper() == "FOK":
+                _success = status == "matched"
+            else:
+                _success = status in ("matched", "live", "delayed")
+
             result = OrderResult(
-                success    = status in ("matched", "live", "delayed"),
+                success    = _success,
                 mode       = TradingMode.REAL,
                 order_id   = order_id,
                 token_id   = token_id,
