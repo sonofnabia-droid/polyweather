@@ -1777,6 +1777,172 @@ def run(wu_key: str, threshold: float, bankroll: float,
     _tg_last_dashboard    = 0
     _tg_dashboard_interval = 30 * 60
 
+    # ── Teste de compra interactivo (só modo não-headless) ────────────────────
+    # Permite verificar que as credenciais, allowances e CLOB estão funcionais
+    # antes de entrar no loop principal. Compra $1 no bracket com ask mais alto
+    # (= mercado considera mais provável), usando o preço real do order book.
+    # Não aparece em modo --headless.
+    if not headless and trading_mode == TradingMode.REAL and market and clob:
+
+        # ── 0. Verificar ordens pendentes e pedir para fechar ─────────────────
+        print(f"\n  {B}{C['cyan']}── Estado da conta ─────────────────────────────{R}")
+
+        # Saldo actual — usa executor que tem get_balance_allowance funcional
+        _cur_balance = executor.get_balance() if executor else None
+        if _cur_balance is not None:
+            _bal_color = C['green'] if _cur_balance >= 5 else C['yellow']
+            print(f"  Saldo USDC : {_bal_color}{B}${_cur_balance:.2f}{R}")
+        else:
+            print(f"  Saldo USDC : {DIM}indisponível{R}")
+
+        # Ordens abertas — usa executor.get_open_orders() que trata 401 graciosamente
+        _open_orders = executor.get_open_orders() if executor else []
+        # Filtrar só as que estão vivas (live/delayed/open)
+        _live_statuses = {"live", "delayed", "open", "LIVE", "DELAYED", "OPEN"}
+        if _open_orders:
+            _open_orders = [o for o in _open_orders
+                            if isinstance(o, dict) and o.get("status", "") in _live_statuses]
+
+        if _open_orders:
+            print(f"\n  {C['yellow']}{B}Ordens pendentes ({len(_open_orders)}){R}")
+            for _o in _open_orders:
+                _oid   = _o.get("id") or _o.get("orderID") or "?"
+                _size  = _o.get("size") or _o.get("originalSize") or "?"
+                _price = _o.get("price", "?")
+                _tok   = (_o.get("asset_id") or _o.get("token_id") or "")[:16]
+                _st    = _o.get("status", "?")
+                print(f"    {DIM}{_oid[:20]}...{R}  "
+                      f"price={C['yellow']}{_price}{R}  size={_size}  "
+                      f"status={_st}  token=...{_tok}")
+
+            print()
+            try:
+                _close_ans = input(
+                    f"  Cancelar {B}todas as ordens pendentes{R}?  "
+                    f"({C['green']}s{R}/{C['red']}n{R}): "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _close_ans = "n"
+
+            if _close_ans == "s":
+                print(f"  {DIM}A cancelar {len(_open_orders)} ordem(ns)...{R}", end=" ", flush=True)
+                _cancelled = 0
+                _failed    = 0
+                try:
+                    # Tenta cancel_all primeiro (mais eficiente)
+                    if executor and executor.cancel_all():
+                        _cancelled = len(_open_orders)
+                    else:
+                        # Fallback: cancelar uma a uma via executor.cancel(id)
+                        for _o in _open_orders:
+                            _oid = _o.get("id") or _o.get("orderID")
+                            if not _oid:
+                                continue
+                            if executor and executor.cancel(_oid):
+                                _cancelled += 1
+                            else:
+                                print(f"\n  {C['red']}  ✗ {_oid[:20]}: falhou{R}")
+                                _failed += 1
+                except Exception as _ce:
+                    print(f"{C['red']}✗  {_ce}{R}")
+                    _failed += len(_open_orders)
+
+                if _cancelled > 0:
+                    print(f"{C['green']}✓  {_cancelled} cancelada(s){R}"
+                          + (f"  {C['red']}({_failed} falhas){R}" if _failed else ""))
+                    # Actualizar saldo após cancelamento
+                    import time as _time; _time.sleep(1.5)
+                    _cur_balance = clob.get_usdc_balance()
+                    if _cur_balance is not None:
+                        _bal_color = C['green'] if _cur_balance >= 5 else C['yellow']
+                        print(f"  Saldo actualizado : {_bal_color}{B}${_cur_balance:.2f}{R}")
+                        # Actualizar bankroll com saldo real
+                        if _cur_balance > 0:
+                            bankroll = _cur_balance
+            else:
+                print(f"  {DIM}Ordens mantidas — a continuar.{R}")
+        else:
+            print(f"  {DIM}Sem ordens pendentes.{R}")
+
+        print()
+
+        # ── 1. Teste de compra ────────────────────────────────────────────────
+        # Mínimo real do CLOB é $1, mas o bot usa $5 por segurança (MIN_SIZE=5.0)
+        try:
+            from polymarket_clob import MIN_SIZE as _CLOB_MIN
+        except ImportError:
+            _CLOB_MIN = 5.0
+        _TEST_SIZE = max(5.0, _CLOB_MIN)   # garante que nunca fica abaixo do mínimo
+
+        _brackets_ok = [b for b in market["brackets"]
+                        if b.get("token_id") and b.get("ask") and 0.02 < b["ask"] < 0.98]
+        if _brackets_ok:
+            _best = max(_brackets_ok, key=lambda b: b["ask"])
+            _ask  = _best["ask"]
+            print(f"\n  {B}{C['cyan']}── Teste de compra ─────────────────────────────{R}")
+            print(f"  Bracket mais provável : {B}{_best['label']}{R}")
+            print(f"  Ask (preço real CLOB) : {C['green']}{_ask:.4f}{R}  ({_ask*100:.1f}¢ por share)")
+            if _best.get("bid"):
+                print(f"  Bid                   : {DIM}{_best['bid']:.4f}{R}   "
+                      f"Spread: {DIM}{(_ask - _best['bid'])*100:.2f}¢{R}")
+            print(f"  Token ID              : {DIM}{_best['token_id']}{R}")
+            print(f"  Montante              : {C['yellow']}${_TEST_SIZE:.2f} USDC{R}  "
+                  f"{DIM}(mínimo do CLOB){R}")
+            print()
+            try:
+                _ans = input(
+                    f"  Comprar {B}${_TEST_SIZE:.0f} USDC{R} neste bracket para testar a ligação?"
+                    f"  ({C['green']}s{R}/{C['red']}n{R}): "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _ans = "n"
+
+            if _ans == "s":
+                print(f"\n  {DIM}A enviar ordem de ${_TEST_SIZE:.0f} USDC...{R}", end=" ", flush=True)
+                try:
+                    _result = clob.buy_yes(
+                        token_id      = _best["token_id"],
+                        price         = _ask,
+                        size_usdc     = _TEST_SIZE,
+                        bracket_label = _best["label"],
+                        market_slug   = market.get("slug", ""),
+                        order_type    = "FOK",   # Fill-or-Kill: preenche agora ou cancela
+                    )
+                    if _result.success:
+                        print(f"{C['green']}✓  Ordem enviada com sucesso!{R}")
+                        print(f"\n  Order ID : {C['green']}{B}{_result.order_id}{R}")
+                        print(f"  Shares   : {_result.shares:.4f}  @ {_result.price:.4f} USDC")
+                        print(f"  Custo    : {C['green']}${_result.size_usdc:.2f} USDC{R}")
+                        print(f"  Status   : {C['green']}{_result.status}{R}")
+                        tg.send(
+                            f"🧪 *Teste de compra OK*\n"
+                            f"Bracket: `{_best['label']}`\n"
+                            f"Order ID: `{_result.order_id}`\n"
+                            f"Shares: {_result.shares:.4f} @ {_result.price:.4f}\n"
+                            f"Custo: ${_result.size_usdc:.2f} USDC\n"
+                            f"Status: {_result.status}"
+                        )
+                    else:
+                        print(f"{C['red']}✗  Falhou!{R}")
+                        print(f"\n  Erro: {C['red']}{_result.error}{R}")
+                        tg.send(f"🧪 *Teste de compra FALHOU*\n`{_result.error}`")
+                except Exception as _e:
+                    print(f"{C['red']}✗  Excepção inesperada:{R}")
+                    print(f"  {C['red']}{_e}{R}")
+                    import traceback
+                    traceback.print_exc()
+                # ── Pausa: impede que o dashboard limpe o resultado imediatamente ──
+                print()
+                try:
+                    input(f"  {DIM}Prima Enter para iniciar o loop...{R}")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+            else:
+                print(f"  {DIM}Teste de compra ignorado — a entrar no loop.{R}")
+            print()
+        else:
+            print(f"  {DIM}(Teste de compra: nenhum bracket com token_id+ask válido disponível){R}\n")
+
     print(f"\n  {DIM}A iniciar loop — Ctrl+C para parar{R}\n")
     time.sleep(2)
 
@@ -1976,6 +2142,26 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 elif not market:
                     bet_blocked_reason = "sem mercado Polymarket"
+                    # Em headless: se passou das 21h Berlin e não há mercado de hoje,
+                    # pré-carregar o mercado de amanhã para estar pronto quando o loop avançar.
+                    if headless and berlin_now().hour >= 21 and market_date == today:
+                        _tmrw = today + timedelta(days=1)
+                        _new_mkt = fetch_market(_tmrw)
+                        if _new_mkt:
+                            market_date = _tmrw
+                            market      = _new_mkt
+                            if clob:
+                                market["brackets"] = [clob.enrich_bracket(b)
+                                                      for b in market["brackets"]]
+                            _reset = reset_market_state_for_future()
+                            peak_detected = _reset["peak_detected"]
+                            bet_placed    = _reset["bet_placed"]
+                            signals       = _reset["signals"]
+                            forecast_max  = _reset["forecast_max"]
+                            bracket       = _reset["bracket"]
+                            bets_path     = LOG_DIR / f"bets_{market_date}.json"
+                            bet_blocked_reason = None
+                            print(f"  [Headless] Mercado hoje fechado — a avançar para {market_date}")
 
                 elif not bracket and _forecast_missing:
                     # Mercado futuro mas WU forecast não disponível —
@@ -2032,14 +2218,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         forecast_max  = _reset["forecast_max"]
                         bracket       = _reset["bracket"]
 
-                        print(f"  {C['yellow']}↺ Reset de estado para mercado futuro{R}")# 🔥 RESET CRÍTICO AQUI
-                        _reset = reset_market_state_for_future()
-                        peak_detected = _reset["peak_detected"]
-                        bet_placed    = _reset["bet_placed"]
-                        signals       = _reset["signals"]
-                        forecast_max  = _reset["forecast_max"]
-                        bracket       = _reset["bracket"]
-
                         print(f"  {C['yellow']}↺ Reset de estado para mercado futuro{R}")
                         print(f"  {C['cyan']}A carregar mercado {market_date}...{R}", end=" ", flush=True)
                         new_market = fetch_market(market_date)
@@ -2086,10 +2264,11 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 bet_blocked_reason = "OrderExecutor não disponível"
                             else:
                                 result = executor.buy(
-                                    token_id  = bracket.get("token_id", ""),
-                                    price     = ask_price,
-                                    size_usdc = bet_record["bet_size"],
-                                    label     = bracket["label"],
+                                    token_id   = bracket.get("token_id", ""),
+                                    price      = ask_price,
+                                    size_usdc  = bet_record["bet_size"],
+                                    label      = bracket["label"],
+                                    order_type = "FOK",
                                 )
                                 if result["success"]:
                                     bet_record["order_id"] = result["order_id"]
