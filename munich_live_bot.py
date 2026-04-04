@@ -901,10 +901,18 @@ def display_positions(positions: "PositionManager", trading_mode: TradingMode,
     else:
         bal_part = ""
 
-    print(f"\n  {B}Posições [{mode_tag}]{R}{bal_part}  "
-          f"{DIM}abertas:{summary['n_open']}  "
-          f"ganhas:{summary['n_won']}  "
-          f"perdidas:{summary['n_lost']}{R}")
+    _nc = summary["n_won"] + summary["n_lost"]
+    _wr_col = C["green"] if (summary["n_won"] / _nc >= 0.5 if _nc else False) else C["red"]
+    _wr_s   = f"{_wr_col}{summary['n_won']/_nc*100:.0f}%{R}" if _nc > 0 else f"{DIM}—{R}"
+    _pnl_col = C["green"] if summary["total_pnl_usd"] >= 0 else C["red"]
+    _pnl_s   = (f"{_pnl_col}{B}{summary['total_pnl_usd']:+.2f}"
+                f" ({summary['total_pnl_pct']:+.1f}%){R}")
+    print(f"\n  {B}Posições [{mode_tag}]{R}{bal_part}")
+    print(f"  {DIM}  ·{R} abertas:{B}{summary['n_open']}{R}"
+          f"  {C['green']}ganhas:{summary['n_won']}{R}"
+          f"  {C['red']}perdidas:{summary['n_lost']}{R}"
+          f"  win rate:{_wr_s}"
+          f"  P&L:{_pnl_s}")
 
     if not all_pos:
         print(f"    {DIM}Sem posições registadas ainda.{R}")
@@ -981,7 +989,7 @@ def display_positions(positions: "PositionManager", trading_mode: TradingMode,
               and p.order_id not in shown_ids]
     if closed:
         print(f"  {DIM}  {'─'*78}{R}")
-        for pos in sorted(closed, key=lambda p: p.date_opened, reverse=True)[:5]:
+        for pos in sorted(closed, key=lambda p: p.date_opened, reverse=True):
             _fmt_position(pos, highlight=False)
 
     # ── Totais ────────────────────────────────────────
@@ -1973,6 +1981,14 @@ def run(wu_key: str, threshold: float, bankroll: float,
             # Novo dia
             station_date = berlin_date()
             if station_date != today:
+                # ── Resumo do dia que terminou ──────────────────────
+                if clob and clob.positions:
+                    _prev_day_str = today.isoformat()
+                    _day_pos = [p for p in clob.positions.all_positions()
+                                if p.date_opened == _prev_day_str]
+                    _cumul   = clob.positions.pnl_summary()
+                    tg.alert_day_summary(_prev_day_str, _day_pos, _cumul)
+
                 today         = station_date
                 market_date   = today          # reset: mercado volta a ser o de hoje
                 slots_so_far  = []
@@ -2142,26 +2158,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 elif not market:
                     bet_blocked_reason = "sem mercado Polymarket"
-                    # Em headless: se passou das 21h Berlin e não há mercado de hoje,
-                    # pré-carregar o mercado de amanhã para estar pronto quando o loop avançar.
-                    if headless and berlin_now().hour >= 21 and market_date == today:
-                        _tmrw = today + timedelta(days=1)
-                        _new_mkt = fetch_market(_tmrw)
-                        if _new_mkt:
-                            market_date = _tmrw
-                            market      = _new_mkt
-                            if clob:
-                                market["brackets"] = [clob.enrich_bracket(b)
-                                                      for b in market["brackets"]]
-                            _reset = reset_market_state_for_future()
-                            peak_detected = _reset["peak_detected"]
-                            bet_placed    = _reset["bet_placed"]
-                            signals       = _reset["signals"]
-                            forecast_max  = _reset["forecast_max"]
-                            bracket       = _reset["bracket"]
-                            bets_path     = LOG_DIR / f"bets_{market_date}.json"
-                            bet_blocked_reason = None
-                            print(f"  [Headless] Mercado hoje fechado — a avançar para {market_date}")
 
                 elif not bracket and _forecast_missing:
                     # Mercado futuro mas WU forecast não disponível —
@@ -2218,6 +2214,14 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         forecast_max  = _reset["forecast_max"]
                         bracket       = _reset["bracket"]
 
+                        print(f"  {C['yellow']}↺ Reset de estado para mercado futuro{R}")# 🔥 RESET CRÍTICO AQUI
+                        _reset = reset_market_state_for_future()
+                        peak_detected = _reset["peak_detected"]
+                        bet_placed    = _reset["bet_placed"]
+                        signals       = _reset["signals"]
+                        forecast_max  = _reset["forecast_max"]
+                        bracket       = _reset["bracket"]
+
                         print(f"  {C['yellow']}↺ Reset de estado para mercado futuro{R}")
                         print(f"  {C['cyan']}A carregar mercado {market_date}...{R}", end=" ", flush=True)
                         new_market = fetch_market(market_date)
@@ -2264,11 +2268,10 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 bet_blocked_reason = "OrderExecutor não disponível"
                             else:
                                 result = executor.buy(
-                                    token_id   = bracket.get("token_id", ""),
-                                    price      = ask_price,
-                                    size_usdc  = bet_record["bet_size"],
-                                    label      = bracket["label"],
-                                    order_type = "FOK",
+                                    token_id  = bracket.get("token_id", ""),
+                                    price     = ask_price,
+                                    size_usdc = bet_record["bet_size"],
+                                    label     = bracket["label"],
                                 )
                                 if result["success"]:
                                     bet_record["order_id"] = result["order_id"]
@@ -2304,7 +2307,12 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
             # ── Refresh posições (bid actual + resolução REAL) ──
             if clob:
+                _pre_resolved = {p.order_id: p.status for p in clob.positions.all_positions()}
                 clob.positions.refresh(clob)
+                for _pos in clob.positions.all_positions():
+                    _was = _pre_resolved.get(_pos.order_id)
+                    if _was and _was.value == "open" and _pos.status.value in ("won", "lost"):
+                        tg.alert_position_resolved(_pos)
 
             display(
                 now, latest_obs, temps_by_hour, series_today, signals_by_hour, p,
@@ -2378,24 +2386,26 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _obs = (obs_min_today or {}).get(_rs)
                     _rmax_ts = f"{_obs[0]}:{_obs[1]:02d}" if _obs else f"{_rs[0]}h"
                 tg.dashboard(
-                    today        = today,
-                    p            = p,
-                    rmax         = rmax,
-                    rmax_time    = _rmax_ts,
-                    temp_now     = latest_obs["temp_c"] if latest_obs else None,
-                    forecast_max = forecast_max,
-                    market       = market,
-                    bracket      = bracket,
-                    ev           = ev,
-                    peak_detected = peak_detected,
-                    bet          = bets[-1] if bets else None,
-                    clob_mode    = clob_mode_str,
-                    reason       = "periodic",
+                    today             = today,
+                    p                 = p,
+                    rmax              = rmax,
+                    rmax_time         = _rmax_ts,
+                    temp_now          = latest_obs["temp_c"] if latest_obs else None,
+                    forecast_max      = forecast_max,
+                    market            = market,
+                    bracket           = bracket,
+                    ev                = ev,
+                    peak_detected     = peak_detected,
+                    bet               = bets[-1] if bets else None,
+                    clob_mode         = clob_mode_str,
+                    reason            = "periodic",
+                    positions_summary = clob.positions.pnl_summary() if clob else None,
                 )
 
     except KeyboardInterrupt:
         print(f"\n\n  {DIM}Stopped.  Logs em ./{LOG_DIR}/{R}")
-        tg.alert_stopped(bets, clob_mode_str)
+        _stop_summary = clob.positions.pnl_summary() if clob else None
+        tg.alert_stopped(bets, clob_mode_str, cumulative_summary=_stop_summary)
         if bets:
             mode_label = "simuladas" if trading_mode == TradingMode.PAPER else "reais"
             print(f"  {C['green']}{len(bets)} ordens {mode_label} → {bets_path}{R}")
