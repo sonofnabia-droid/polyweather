@@ -1,5 +1,5 @@
-"""
-tg.py — Telegram notifier minimalista para o munich_live_bot.
+v"""
+tg.py — Telegram notifier para o munich_live_bot.
 Uso:
     from tg import TG
     tg = TG()   # lê TELEGRAM_TOKEN e TELEGRAM_CHAT_ID do ambiente
@@ -45,74 +45,172 @@ class TG:
                       month: int, market: dict | None, today) -> bool:
         mode_icon = "🟢" if mode == "real" else "🟡"
         if market:
-            mkt = f"✅ <b>{market['title'][:40]}</b>\n  vol ${market['volume']:,.0f}  | {market['n_outcomes']} brackets"
+            mkt = (f"✅ <b>{market['title'][:40]}</b>\n"
+                   f"  vol ${market['volume']:,.0f}  | {market['n_outcomes']} brackets")
         else:
             mkt = "⚠️ mercado não encontrado"
         thr_str = (f"{threshold_month*100:.0f}% <i>(adaptativo mês {month})</i>"
                    if abs(threshold_month - threshold_arg) > 0.01
                    else f"{threshold_arg*100:.0f}%")
-        return self.send(
-            f"{mode_icon} <b>Munich Bot arrancou</b>  {today}\n"
-            f"  Modo: <b>{mode.upper()}</b>   Bankroll: <b>${bankroll:.2f}</b>\n"
-            f"  Threshold: {thr_str}\n"
-            f"  {mkt}"
-        )
+        lines = [
+            f"{mode_icon} <b>Munich Bot arrancou</b>  {today}",
+            f"  Modo: <b>{mode.upper()}</b>   Bankroll: <b>${bankroll:.2f}</b>",
+            f"  Threshold: {thr_str}",
+            f"  {mkt}",
+        ]
+        return self.send("\n".join(lines))
 
     def alert_no_market(self, today) -> bool:
-        return self.send(
-            f"⚠️ <b>Mercado não encontrado</b>  {today}\n"
-            f"  O Polymarket ainda não criou o mercado de hoje.\n"
-            f"  A tentar novamente a cada 10 minutos."
-        )
+        lines = [
+            f"⚠️ <b>Mercado não encontrado</b>  {today}",
+            "  O Polymarket ainda não criou o mercado de hoje.",
+            "  A tentar novamente a cada 10 minutos.",
+        ]
+        return self.send("\n".join(lines))
 
     def alert_peak_detected(self, p: float, rmax: float, rmax_time: str,
                             bracket: dict | None) -> bool:
-        bracket_str = f"  Bracket alvo: <b>{bracket['label']}</b>  ask {bracket.get('ask', bracket.get('price', 0))*100:.1f}¢" if bracket else ""
-        return self.send(
-            f"🔔 <b>PICO DETECTADO</b>\n"
-            f"  P = <b>{p*100:.0f}%</b>   running max <b>{int(round(rmax))}°C</b> @{rmax_time}\n"
-            f"{bracket_str}"
-        )
+        bracket_str = ""
+        if bracket:
+            ask = bracket.get("ask") or bracket.get("price", 0)
+            bracket_str = f"\n  Bracket alvo: <b>{bracket['label']}</b>  ask {ask*100:.1f}¢"
+        lines = [
+            "🔔 <b>PICO DETECTADO</b>",
+            f"  P = <b>{p*100:.0f}%</b>   running max <b>{int(round(rmax))}°C</b> @{rmax_time}{bracket_str}",
+        ]
+        return self.send("\n".join(lines))
 
     def alert_order_placed(self, bet: dict) -> bool:
-        mode = "REAL 💰" if not bet.get("simulated") else "PAPER 🟡"
-        # compatibilidade com ambos os nomes de campo
-        ask      = bet.get("ask") or bet.get("price", 0)
-        size     = bet.get("bet_size") or bet.get("size_usd", 0)
-        shares   = bet.get("shares", 0)
-        profit   = bet.get("max_profit", 0)
-        order_id = bet.get("order_id", "?")
-        return self.send(
-            f"{'✅' if not bet.get('simulated') else '🟡'} <b>Ordem colocada [{mode}]</b>\n"
-            f"  Bracket: <b>{bet['bracket']}</b>   Ask: {ask*100:.1f}¢\n"
-            f"  ${size:.2f}  →  {shares:.2f} shares   max +${profit:.2f}\n"
-            f"  ID: <code>{order_id}</code>"
-        )
+        mode      = "REAL 💰" if not bet.get("simulated") else "PAPER 🟡"
+        icon      = "✅" if not bet.get("simulated") else "🟡"
+        ask       = bet.get("ask") or bet.get("price", 0)
+        size      = bet.get("bet_size") or bet.get("size_usd", 0)
+        shares    = bet.get("shares", 0)
+        profit    = bet.get("max_profit", 0)
+        order_id  = bet.get("order_id", "?")
+        lines = [
+            f"{icon} <b>Ordem colocada [{mode}]</b>",
+            f"  Bracket: <b>{bet['bracket']}</b>   Ask: {ask*100:.1f}¢",
+            f"  ${size:.2f}  →  {shares:.2f} shares   max +${profit:.2f}",
+            f"  ID: <code>{order_id}</code>",
+        ]
+        return self.send("\n".join(lines))
 
     def alert_order_failed(self, error: str, bracket: dict | None) -> bool:
-        bracket_str = bracket['label'] if bracket else "?"
-        return self.send(
-            f"❌ <b>Ordem REAL falhou</b>\n"
-            f"  Bracket: {bracket_str}\n"
-            f"  Erro: <code>{error[:200]}</code>"
-        )
+        bracket_str = bracket["label"] if bracket else "?"
+        lines = [
+            "❌ <b>Ordem REAL falhou</b>",
+            f"  Bracket: {bracket_str}",
+            f"  Erro: <code>{error[:200]}</code>",
+        ]
+        return self.send("\n".join(lines))
 
-    def alert_stopped(self, bets: list, mode: str) -> bool:
+    def alert_position_resolved(self, pos) -> bool:
+        """
+        Enviado quando uma posição passa de OPEN → WON ou LOST.
+        pos: instância de Position do polymarket_clob.
+        """
+        won      = pos.status.value == "won"
+        icon     = "🏆" if won else "💸"
+        result   = "GANHOU" if won else "PERDEU"
+        pnl_s    = f"{pos.pnl_usd:+.2f}" if pos.pnl_usd is not None else "?"
+        pnl_p    = f"{pos.pnl_pct:+.1f}%" if pos.pnl_pct is not None else "?"
+        entry_s  = f"{pos.entry_ask*100:.1f}¢"
+        lines = [
+            f"{icon} <b>Posição resolvida — {pos.date_opened}</b>",
+            f"  Bracket: <b>{pos.bracket_label}</b>",
+            f"  Entrada: {entry_s}   Shares: {pos.shares:.2f}",
+            f"  Resultado: <b>{result}</b>",
+            f"  P&amp;L: <b>{pnl_s}</b> ({pnl_p})",
+        ]
+        return self.send("\n".join(lines))
+
+    def alert_day_summary(self, day_str: str, day_positions: list,
+                          cumulative_summary: dict) -> bool:
+        """
+        Resumo do dia que terminou — enviado no rollover de meia-noite.
+        day_positions : lista de Position do dia.
+        cumulative_summary : dict de pnl_summary() com totais acumulados.
+        """
+        n_bets  = len(day_positions)
+        n_won   = sum(1 for p in day_positions if p.status.value == "won")
+        n_lost  = sum(1 for p in day_positions if p.status.value == "lost")
+        invested = sum(p.size_usdc for p in day_positions)
+        day_pnl  = sum(p.pnl_usd for p in day_positions if p.pnl_usd is not None)
+        roi      = (day_pnl / invested * 100) if invested > 0 else 0.0
+
+        if n_bets == 0:
+            lines = [
+                f"📅 <b>Fim do dia — {day_str}</b>",
+                "  Sem bets hoje.",
+            ]
+        else:
+            pnl_icon = "📈" if day_pnl >= 0 else "📉"
+            lines = [
+                f"📅 <b>Fim do dia — {day_str}</b>",
+                f"  Bets: {n_bets}   ✅ {n_won}  ❌ {n_lost}",
+                f"  Investido: ${invested:.2f}",
+                f"  {pnl_icon} P&amp;L dia: <b>{day_pnl:+.2f}</b> ({roi:+.1f}%)",
+                "",
+            ]
+            # Detalhe de cada bet do dia
+            for pos in day_positions:
+                st_icon = "✅" if pos.status.value == "won" else ("❌" if pos.status.value == "lost" else "⏳")
+                pnl_s = f"{pos.pnl_usd:+.2f}" if pos.pnl_usd is not None else "?"
+                lines.append(
+                    f"  {st_icon} {pos.bracket_label:<16} {pos.entry_ask*100:.0f}¢  {pnl_s}"
+                )
+            lines.append("")
+
+        # Totais acumulados
+        s = cumulative_summary
+        nc = s["n_won"] + s["n_lost"]
+        wr_s = f"{s['n_won']/nc*100:.0f}%" if nc > 0 else "—"
+        lines += [
+            "─────────────────",
+            f"  Acumulado: {s['n_won']}W / {s['n_lost']}L   Win rate: <b>{wr_s}</b>",
+            f"  Investido total: ${s['total_invested']:.2f}",
+            f"  P&amp;L total: <b>{s['total_pnl_usd']:+.2f}</b> ({s['total_pnl_pct']:+.1f}%)",
+        ]
+        return self.send("\n".join(lines))
+
+    def alert_stopped(self, bets: list, mode: str,
+                      cumulative_summary: dict | None = None) -> bool:
+        """
+        Enviado ao parar o bot (Ctrl+C ou shutdown).
+        Se cumulative_summary for passado, inclui os totais acumulados.
+        """
         mode_label = "REAL" if mode == "real" else "PAPER"
+        lines = [f"🛑 <b>Bot parado</b>  [{mode_label}]"]
+
         if bets:
-            return self.send(
-                f"🛑 <b>Bot parado</b>  [{mode_label}]\n"
-                f"  {len(bets)} ordem(s) registada(s) hoje."
-            )
-        return self.send(f"🛑 <b>Bot parado</b>  [{mode_label}]  sem ordens hoje.")
+            lines.append(f"  {len(bets)} ordem(s) registada(s) hoje.")
+        else:
+            lines.append("  Sem ordens hoje.")
+
+        if cumulative_summary:
+            s  = cumulative_summary
+            nc = s["n_won"] + s["n_lost"]
+            wr_s = f"{s['n_won']/nc*100:.0f}%" if nc > 0 else "—"
+            lines += [
+                "",
+                "─────────────────",
+                f"  <b>Resumo total</b>",
+                f"  {s['n_won']}W / {s['n_lost']}L   Win rate: <b>{wr_s}</b>",
+                f"  Investido: ${s['total_invested']:.2f}",
+                f"  P&amp;L: <b>{s['total_pnl_usd']:+.2f}</b> ({s['total_pnl_pct']:+.1f}%)",
+                f"  Posições abertas: {s['n_open']}",
+            ]
+        return self.send("\n".join(lines))
 
     def alert_zone_change(self, p: float, zone: int) -> bool:
-        icons = {0: "⚪", 1: "🟠", 2: "🟡", 3: "🟢"}
+        icons  = {0: "⚪", 1: "🟠", 2: "🟡", 3: "🟢"}
         labels = {0: "< 30%", 1: "30–60%", 2: "60–80%", 3: "≥ 80%"}
-        return self.send(
-            f"{icons[zone]} <b>P(pico) mudou de zona</b>\n"
-            f"  Agora: <b>{p*100:.0f}%</b>  ({labels[zone]})"
-        )
+        lines = [
+            f"{icons[zone]} <b>P(pico) mudou de zona</b>",
+            f"  Agora: <b>{p*100:.0f}%</b>  ({labels[zone]})",
+        ]
+        return self.send("\n".join(lines))
 
     # ── Dashboard periódica ────────────────────────────
 
@@ -129,12 +227,14 @@ class TG:
                   peak_detected: bool,
                   bet: dict | None,
                   clob_mode: str,
-                  reason: str = "periodic") -> bool:
+                  reason: str = "periodic",
+                  positions_summary: dict | None = None) -> bool:
         """
-        Envia dashboard formatada para Telegram.
+        Envia dashboard formatada para Telegram a cada 30 min.
         reason: "periodic" | "zone_change" | "market_open"
+        positions_summary: resultado de clob.positions.pnl_summary() (opcional)
         """
-        now_str  = datetime.now().strftime("%H:%M")
+        now_str   = datetime.now().strftime("%H:%M")
         mode_icon = "🟢" if clob_mode == "real" else "🟡"
 
         lines = [
@@ -146,17 +246,17 @@ class TG:
         temp_str = f"{int(round(temp_now))}°C" if temp_now is not None else "—"
         fc_str   = f"   prev {forecast_max['temp_max']}°C" if forecast_max else ""
         lines += [
-            f"🌡 <b>Temperatura</b>",
+            "🌡 <b>Temperatura</b>",
             f"  Agora: <b>{temp_str}</b>   Max: <b>{int(round(rmax))}°C</b> @{rmax_time}{fc_str}",
             "",
         ]
 
         # Modelo
-        p_bar = _tg_bar(p, width=10)
+        p_bar  = _tg_bar(p, width=10)
         p_icon = "🟢" if p >= 0.80 else ("🟡" if p >= 0.60 else ("🟠" if p >= 0.30 else "⚪"))
         peak_str = "  ✅ <b>PICO DETECTADO</b>" if peak_detected else ""
         lines += [
-            f"🧠 <b>P(pico já ocorreu)</b>",
+            "🧠 <b>P(pico já ocorreu)</b>",
             f"  {p_icon} {p_bar} <b>{p*100:.0f}%</b>{peak_str}",
             "",
         ]
@@ -169,10 +269,10 @@ class TG:
                 f"📋 <b>{market['title'][:40]}</b>",
                 f"  vol ${market['volume']:,.0f}  |  {market['n_outcomes']} brackets",
                 "",
+                "<pre>",
+                f"{'Bracket':<16} {'Ask':>5}  {'Bar':8}",
+                "─" * 32,
             ]
-            lines.append("<pre>")
-            lines.append(f"{'Bracket':<16} {'Ask':>5}  {'Bar':8}")
-            lines.append("─" * 32)
             for b in market["brackets"]:
                 arrow   = "→" if bracket and b["label"] == bracket["label"] else " "
                 ask_val = b.get("ask") or b.get("price") or 0
@@ -204,6 +304,22 @@ class TG:
         else:
             lines.append("💤 Sem bet ainda")
 
+        # ── P&L acumulado ─────────────────────────────────
+        if positions_summary and (positions_summary["n_won"] + positions_summary["n_lost"]) > 0:
+            s  = positions_summary
+            nc = s["n_won"] + s["n_lost"]
+            wr = s["n_won"] / nc * 100
+            wr_icon = "📈" if s["total_pnl_usd"] >= 0 else "📉"
+            lines += [
+                "",
+                f"{wr_icon} <b>Resultados acumulados</b>",
+                f"  {s['n_won']}W / {s['n_lost']}L   win rate {wr:.0f}%",
+                f"  P&amp;L: <b>{s['total_pnl_usd']:+.2f}</b> ({s['total_pnl_pct']:+.1f}%)",
+            ]
+            if s["n_open"] > 0:
+                lines.append(f"  Posições abertas: {s['n_open']}")
+
+        # Rodapé
         reason_str = {
             "periodic":    "⏱ periódico",
             "zone_change": "⚡ mudança de zona",
