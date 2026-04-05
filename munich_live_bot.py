@@ -215,8 +215,13 @@ def find_bracket(market: dict, temp: float) -> dict | None:
 
 
 def compute_ev(p: float, ask: float) -> dict | None:
-    """EV calculado sobre o ask do CLOB."""
+    """EV calculado sobre o ask do CLOB.
+
+    Retorna None se ask >= 0.95 — nesse caso o mercado esta praticamente
+    resolvido e os numeros (Kelly, edge) seriam enganadores.
+    """
     if not ask or not (0 < ask < 1): return None
+    if ask >= 0.95: return None          # mercado resolvido, nao calcular
     ev    = p - ask
     b     = (1 - ask) / ask
     kelly = max(0.0, (p * b - (1 - p)) / b)
@@ -761,23 +766,10 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 # que p oscile abaixo nos ticks seguintes.
 
                 elif ask_price and ask_price >= 0.95:
-                    bet_blocked_reason = f"ask {ask_price*100:.1f}¢ >= 95¢ — mercado: {market_date}"
-                    print(f"\n  {C['red']}⚠  Preco ask demasiado alto ({ask_price*100:.1f}¢)"
-                          f" — mercado {market_date}{R}")
-                    resp = input("  Passar para o mercado de amanha? (s/n): ").strip().lower()
-                    if resp == "s":
-                        market_date = market_date + timedelta(days=1)
-                        print(f"  {C['cyan']}A carregar mercado {market_date}...{R}", end=" ", flush=True)
-                        new_market = fetch_market(market_date)
-                        if new_market:
-                            market = new_market
-                            if clob:
-                                market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
-                            bets_path = LOG_DIR / f"bets_{market_date}.json"
-                            print(f"{C['green']}✓  {new_market['title'][:50]}{R}")
-                        else:
-                            market_date = market_date - timedelta(days=1)
-                            print(f"{C['red']}✗ Mercado nao encontrado — a manter {market_date}{R}")
+                    # Mercado praticamente fechado — bloquear silenciosamente.
+                    # Para passar para amanha usa override manual ('f' + Enter).
+                    bet_blocked_reason = (f"ask {ask_price*100:.1f}¢ >= 95¢ "
+                                         f"(mercado resolvido) — usa 'f' para override")
 
                 elif not ev or not ev["ev_positive"]:
                     bet_blocked_reason = (f"EV negativo ({ev['ev_cents']:+.1f}¢)" if ev
