@@ -1,4 +1,4 @@
-v"""
+"""
 tg.py — Telegram notifier para o munich_live_bot.
 Uso:
     from tg import TG
