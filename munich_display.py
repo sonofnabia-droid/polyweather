@@ -1,21 +1,9 @@
-"""
-munich_display.py
-=================
-Rendering do dashboard terminal (grafico ASCII, tabelas, order book,
-posicoes) e logging CSV.
-
-Exporta:
-  draw_chart(series_today, signals, peak_detected)
-  display(...)
-  display_orderbook(book, bracket_label)
-  display_positions(positions, trading_mode, usdc_balance)
-  log_tick(now, temp, p, peak_detected, bracket, ev, bet, path, ...)
-  p_bar(p, w)
-  p_col(p)
-"""
+# munich_display.py — versão reescrita com risk-first, barra adaptativa,
+# risk_used, risk_remaining, risk_per_trade, sem Kelly.
 
 import csv
 import os
+import shutil
 
 from munich_config import (
     DAY_START, DAY_END,
@@ -29,6 +17,7 @@ from polymarket_clob import TradingMode, PositionStatus
 # ══════════════════════════════════════════════════════
 #  HELPERS VISUAIS
 # ══════════════════════════════════════════════════════
+
 def p_bar(p, w=14) -> str:
     f = round(p * w)
     return "█" * f + "░" * (w - f)
@@ -46,16 +35,27 @@ def _book_bar(price: float, w: int = 20) -> str:
     return "█" * f + "░" * (w - f)
 
 
+def risk_bar(used_pct: float) -> str:
+    """
+    Barra adaptativa (sem limite máximo), monocromática (█ + ▒).
+    """
+    try:
+        cols = shutil.get_terminal_size().columns
+    except Exception:
+        cols = 80
+
+    bar_width = max(20, cols - 40)
+    filled = int(bar_width * used_pct)
+    empty = bar_width - filled
+    return "█" * filled + "▒" * empty
+
+
 # ══════════════════════════════════════════════════════
 #  GRAFICO ASCII
 # ══════════════════════════════════════════════════════
+
 def draw_chart(series_today: dict, signals: dict,
                peak_detected: bool) -> list[str]:
-    """
-    Grafico ASCII da curva de temperatura.
-    series_today : {(hour, slot30): temp_c}
-    signals      : {hour: p}
-    """
     lines = []
     slots = [(h, m) for h in range(DAY_START, DAY_END + 1) for m in (0, 30)]
     temps = [series_today.get(s) for s in slots]
@@ -123,8 +123,8 @@ def draw_chart(series_today: dict, signals: dict,
 # ══════════════════════════════════════════════════════
 #  ORDER BOOK
 # ══════════════════════════════════════════════════════
+
 def display_orderbook(book, bracket_label: str = "") -> None:
-    """Mostra o order book CLOB no terminal (top-3 bids e asks)."""
     if book is None:
         print(f"    {DIM}Order book CLOB indisponivel — a usar preco Gamma{R}")
         return
@@ -163,12 +163,10 @@ def display_orderbook(book, bracket_label: str = "") -> None:
 # ══════════════════════════════════════════════════════
 #  POSICOES
 # ══════════════════════════════════════════════════════
+
 def display_positions(positions, trading_mode: TradingMode,
                       usdc_balance: float | None = None) -> None:
-    """
-    Seccao do dashboard: posicoes abertas e historico.
-    Mostra: hoje em destaque, depois todas as abertas, depois as fechadas.
-    """
+
     all_pos  = positions.all_positions()
     open_pos = positions.open_positions()
     summary  = positions.pnl_summary()
@@ -262,10 +260,10 @@ def display_positions(positions, trading_mode: TradingMode,
               f"{pnl_col}{B}{summary['total_pnl_usd']:+.2f} "
               f"({summary['total_pnl_pct']:+.1f}%){R}")
 
-
 # ══════════════════════════════════════════════════════
 #  DASHBOARD PRINCIPAL
 # ══════════════════════════════════════════════════════
+
 def display(now, latest_obs, temps_by_hour, series_today, signals, p,
             market, bracket, ev, bet,
             n_wu_reads, bankroll, threshold, peak_detected,
@@ -296,24 +294,41 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
           + signal_window_label)
     print(f"  {DIM}Estacao: EDDM Munich Airport (WUnderground){R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # RISK SECTION (risk-first)
+    # ─────────────────────────────────────────────────────────────
+    risk_used = min(1.0, daily_loss / max_daily_loss) if max_daily_loss > 0 else 0
+    risk_remaining = max_daily_loss - daily_loss
+    risk_per_trade = min(max_daily_loss, bankroll * 0.10)
+
     if trading_mode == TradingMode.REAL:
         if usdc_balance is not None:
             bal_col = C["green"] if usdc_balance >= 10 else C["red"]
             bal_str = f"{bal_col}{B}${usdc_balance:,.2f} USDC{R}"
         else:
             bal_str = f"{C['yellow']}a carregar...{R}"
-        loss_col = C["red"] if daily_loss >= max_daily_loss * 0.8 else C["green"]
-        print(f"  {B}Saldo:{R} {bal_str}   "
-              f"{DIM}Perda hoje:{R} {loss_col}{B}${daily_loss:.2f}{R}"
-              f"{DIM} / stop-loss ${max_daily_loss:.0f}{R}")
+
+        print(f"  {B}Saldo:{R} {bal_str}")
+
+        print(f"  {DIM}Risk per trade:{R} ${risk_per_trade:.2f}   "
+              f"{DIM}Max daily loss:{R} ${max_daily_loss:.2f}")
+
+        print(f"  {DIM}Risk used:{R} {risk_used*100:5.1f}%")
+        print(f"  {risk_bar(risk_used)}")
+        print(f"  {DIM}Used:{R} ${daily_loss:.2f}   "
+              f"{DIM}Remaining:{R} ${risk_remaining:.2f}")
 
     print(f"  {DIM}{'─'*58}{R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # TEMPERATURE CHART
+    # ─────────────────────────────────────────────────────────────
     print(f"\n  {B}Curva de temperatura hoje{R}  "
           f"{DIM}(● verde=P>80% amarelo=P>60% laranja=P>30%){R}")
     for line in draw_chart(series_today, signals, peak_detected):
         print(line)
 
+    # Running max
     if series_today:
         rmax_slot    = max(series_today, key=series_today.get)
         rmax         = series_today[rmax_slot]
@@ -344,6 +359,9 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
         print(f"    {DIM}previsao WU :{R} max {fc_col}{B}{forecast_max['temp_max']}°C{R}  "
               f"{DIM}min {forecast_max.get('temp_min', '?')}°C{R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # MODEL OUTPUT
+    # ─────────────────────────────────────────────────────────────
     print(f"\n  {B}Modelo LightGBM — P(pico ja ocorreu){R}")
     print(f"    {pc}{B}{p_bar(p)}{R}  {pc}{B}{p*100:>5.1f}%{R}  "
           f"{DIM}threshold: {threshold*100:.0f}%{R}")
@@ -356,6 +374,9 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
         status = f"{C['gray']}○ monitoring — pico provavelmente nao ocorreu ainda{R}"
     print(f"    {status}")
 
+    # ─────────────────────────────────────────────────────────────
+    # MARKET
+    # ─────────────────────────────────────────────────────────────
     _md        = market_date or berlin_date()
     _today_ref = berlin_date()
     if _md > _today_ref:
@@ -402,6 +423,9 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
             print(f"\n  {B}Order Book CLOB — {bracket['label']}{R}")
             display_orderbook(bracket.get("book"), bracket.get("label", ""))
 
+    # ─────────────────────────────────────────────────────────────
+    # EDGE ANALYSIS (sem Kelly)
+    # ─────────────────────────────────────────────────────────────
     if bracket and ev:
         print(f"\n  {B}Edge Analysis{R}  {DIM}(EV calculado sobre ask){R}")
         ec       = C["green"] if ev["ev_positive"] else C["red"]
@@ -409,17 +433,25 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
         print(f"    Ask: {C['red']}{B}{ask_disp}{R}  "
               f"EV/share: {ec}{B}{ev['ev_cents']:+.1f}¢{R}  "
               f"edge: {ec}{ev['edge_pct']:+.1f}%{R}  "
-              f"Kelly: {B}{ev['kelly']*100:.1f}%{R}  "
               f"bankroll: ${bankroll:.0f}")
 
+    # ─────────────────────────────────────────────────────────────
+    # POSITIONS
+    # ─────────────────────────────────────────────────────────────
     if positions is not None:
         display_positions(positions, trading_mode, usdc_balance=usdc_balance)
     else:
         print(f"\n  {B}Posicoes{R}  {DIM}CLOB nao disponivel{R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # STOP-LOSS
+    # ─────────────────────────────────────────────────────────────
     if trading_mode == TradingMode.REAL and daily_loss >= max_daily_loss:
         print(f"\n  {C['red']}{B}⛔  STOP-LOSS DIARIO ATINGIDO — novas ordens bloqueadas{R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # BET SECTION (risk-first, sem Kelly)
+    # ─────────────────────────────────────────────────────────────
     if not bet and peak_detected and not bet_placed:
         if bet_blocked_reason:
             print(f"\n  {C['yellow']}⚠  Bet bloqueada: {bet_blocked_reason}{R}")
@@ -440,16 +472,19 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
                   f"(spread {bet.get('spread', 0)*100:.1f}¢)")
         else:
             print(f"    Ask        : {bet['ask']*100:.1f}¢")
-        print(f"    Kelly      : {bet['kelly_full']:.1f}% × {bet['kelly_frac']} "
-              f"= {bet['kelly_full']*bet['kelly_frac']:.1f}%")
+
+        print(f"    Sizing     : risk-first  (max loss ${bet['max_daily_loss']:.0f})")
         print(f"    Aposta     : ${bet['bet_size']:.2f}  ({bet['shares']:.2f} shares)")
         print(f"    Max profit : +${bet['max_profit']:.2f}")
-        if bet.get("order_id"):
+        if bet.get('order_id'):
             print(f"    Order ID   : {bet['order_id']}")
-        if bet.get("status"):
+        if bet.get('status'):
             print(f"    Status     : {bet['status']}")
         print(f"  {border_col}{B}{'─'*44}{R}")
 
+    # ─────────────────────────────────────────────────────────────
+    # FOOTER
+    # ─────────────────────────────────────────────────────────────
     print(f"\n  {DIM}{'─'*58}{R}")
     if trading_mode == TradingMode.REAL:
         if usdc_balance is not None:
@@ -483,6 +518,7 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
 # ══════════════════════════════════════════════════════
 #  LOGGING CSV
 # ══════════════════════════════════════════════════════
+
 def log_tick(now, temp, p, peak_detected, bracket, ev, bet,
              path, trading_mode: TradingMode = TradingMode.PAPER,
              bet_blocked_reason=None) -> None:
