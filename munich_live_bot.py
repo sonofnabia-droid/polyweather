@@ -235,26 +235,36 @@ def compute_ev(p: float, ask: float) -> dict | None:
     }
 
 
-def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode) -> dict:
-    bet_size = bankroll * ev["kelly"] * kelly_frac
-    ask      = ev["ask"]
+def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
+                     max_daily_loss: float = 10.0) -> dict:
+    """
+    Sizing: Risk-First.
+    A aposta e sempre max_daily_loss — o maximo que estamos dispostos a perder.
+    Kelly foi removido: nao e calibrado para P(bracket ganha), apenas para
+    P(pico ja ocorreu), o que gera sizes incorrectos neste contexto.
+    EV e edge continuam a ser calculados e mostrados no dashboard como info.
+    """
+    ask      = ask_price if (ask_price := (bracket.get("ask") or bracket.get("price"))) else (ev["ask"] if ev else 0)
+    bet_size = round(min(max_daily_loss, bankroll * 0.10), 2)  # nunca mais de 10% do bankroll
     shares   = round(bet_size / ask, 4) if ask > 0 else 0
+    ev_cents  = ev["ev_cents"] if ev else None
+    edge_pct  = ev["edge_pct"] if ev else None
     return {
-        "mode":       mode.value,
-        "bracket":    bracket["label"],
-        "token_id":   bracket.get("token_id"),
-        "ask":        round(ask, 4),
-        "bid":        round(bracket.get("bid") or ask, 4),
-        "spread":     round(bracket.get("spread") or 0, 4),
-        "p_true":     round(p, 3),
-        "ev_cents":   ev["ev_cents"],
-        "edge_pct":   ev["edge_pct"],
-        "kelly_full": round(ev["kelly"] * 100, 2),
-        "kelly_frac": kelly_frac,
-        "bet_size":   round(bet_size, 2),
-        "shares":     shares,
-        "max_profit": round(shares * (1 - ask), 2),
-        "timestamp":  datetime.now().isoformat(),
+        "mode":         mode.value,
+        "bracket":      bracket["label"],
+        "token_id":     bracket.get("token_id"),
+        "ask":          round(ask, 4),
+        "bid":          round(bracket.get("bid") or ask, 4),
+        "spread":       round(bracket.get("spread") or 0, 4),
+        "p_true":       round(p, 3),
+        "ev_cents":     ev_cents,
+        "edge_pct":     edge_pct,
+        "sizing":       "risk_first",
+        "max_daily_loss": max_daily_loss,
+        "bet_size":     bet_size,
+        "shares":       shares,
+        "max_profit":   round(shares * (1 - ask), 2),
+        "timestamp":    datetime.now().isoformat(),
     }
 
 
@@ -302,7 +312,7 @@ def execute_forced_entry(bracket, ask_price, p, ev,
         if ans != "s":
             return None, "cancelado pelo utilizador"
 
-    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode)
+    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, max_daily_loss=POLY_MAX_DAILY_LOSS)
 
     if trading_mode == TradingMode.PAPER:
         result = paper_buy(
@@ -771,16 +781,16 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     bet_blocked_reason = (f"ask {ask_price*100:.1f}¢ >= 95¢ "
                                          f"(mercado resolvido) — usa 'f' para override")
 
-                elif not ev or not ev["ev_positive"]:
-                    bet_blocked_reason = (f"EV negativo ({ev['ev_cents']:+.1f}¢)" if ev
-                                          else "EV nao calculavel")
-
-                elif ev["edge_pct"] < min_edge:
-                    bet_blocked_reason = f"edge {ev['edge_pct']:.1f}% < min {min_edge:.1f}%"
+                elif not ask_price:
+                    bet_blocked_reason = "ask nao disponivel"
 
                 else:
                     # ── Executar bet ──────────────────
-                    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode)
+                    # EV e edge nao bloqueiam — o modelo deteta o pico,
+                    # nao calibra P(bracket ganha). O sizing e controlado
+                    # por max_daily_loss, nao por Kelly.
+                    # O EV continua a ser mostrado no dashboard como informacao.
+                    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, max_daily_loss=POLY_MAX_DAILY_LOSS)
 
                     if trading_mode == TradingMode.PAPER:
                         result = paper_buy(
@@ -965,11 +975,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Munich Max Temp — Live Bot (WU + Polymarket + LightGBM)"
     )
-    parser.add_argument("--threshold", type=float, default=0.80)
-    parser.add_argument("--bankroll",  type=float, default=200.0)
-    parser.add_argument("--kelly",     type=float, default=0.5)
-    parser.add_argument("--min-edge",  type=float, default=5.0)
-    parser.add_argument("--interval",  type=int,   default=60)
+    parser.add_argument("--threshold",     type=float, default=0.46)
+    parser.add_argument("--bankroll",      type=float, default=200.0)
+    parser.add_argument("--kelly",         type=float, default=0.5)
+    parser.add_argument("--min-edge",      type=float, default=5.0)
+    parser.add_argument("--interval",      type=int,   default=60)
+    parser.add_argument("--max-daily-loss",type=float, default=10.0,
+                        help="Maxima perda aceite por dia em USDC (Risk-First sizing)")
     args = parser.parse_args()
 
     run(
