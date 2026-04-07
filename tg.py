@@ -204,7 +204,7 @@ class TG:
         # ── Dashboard periódica ────────────────────────────
 
     # ✔ FIX: agora aceita trading_mode OU clob_mode
-    def dashboard(self,
+        def dashboard(self,
                   today,
                   p: float,
                   rmax: float,
@@ -218,24 +218,38 @@ class TG:
                   bet: dict | None,
                   clob_mode: str = None,
                   trading_mode: str = None,
+                  chart: list | None = None,
                   reason: str = "periodic",
                   positions_summary: dict | None = None) -> bool:
 
+        # Determinar modo
         mode = trading_mode or clob_mode or "paper"
         mode_icon = "🟢" if mode == "real" else "🟡"
 
         now_str = datetime.now().strftime("%H:%M")
 
+        # Cabeçalho estilo terminal
         lines = [
-            f"{mode_icon} <b>Munich Bot</b>  {today}  {now_str}",
+            f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode.upper()}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
+            f"  Estação: <b>{forecast_max['station'] if forecast_max and 'station' in forecast_max else 'EDDM Munich Airport (WUnderground)'}</b>",
+            f"  ◉ a verificar sinal (:{now_str[-2:]})",
+            "  ──────────────────────────────────────────────────────────",
             "",
         ]
 
-        # Temperatura
+        # Chart ASCII (curva de temperatura)
+        if chart:
+            lines.append("🌡 <b>Curva de temperatura hoje</b>  (● verde=P>80% amarelo=P>60% laranja=P>30%)")
+            lines.append("<pre>")
+            lines.extend(chart)
+            lines.append("</pre>")
+            lines.append("")
+
+        # Temperatura atual
         temp_str = f"{int(round(temp_now))}°C" if temp_now is not None else "—"
         fc_str   = f"   prev {forecast_max['temp_max']}°C" if forecast_max else ""
         lines += [
-            "🌡 <b>Temperatura</b>",
+            "🌡 <b>Temperatura actual</b>",
             f"  Agora: <b>{temp_str}</b>   Max: <b>{int(round(rmax))}°C</b> @{rmax_time}{fc_str}",
             "",
         ]
@@ -243,10 +257,10 @@ class TG:
         # Modelo
         p_bar  = _tg_bar(p, width=10)
         p_icon = "🟢" if p >= 0.80 else ("🟡" if p >= 0.60 else ("🟠" if p >= 0.30 else "⚪"))
-        peak_str = "  ✅ <b>PICO DETECTADO</b>" if peak_detected else ""
+        peak_str = "  ✓ <b>PICO DETECTADO</b>" if peak_detected else ""
         lines += [
-            "🧠 <b>P(pico já ocorreu)</b>",
-            f"  {p_icon} {p_bar} <b>{p*100:.0f}%</b>{peak_str}",
+            "🧠 <b>Modelo LightGBM — P(pico já ocorreu)</b>",
+            f"  {p_bar}  <b>{p*100:.1f}%</b>  threshold: 46%{peak_str}",
             "",
         ]
 
@@ -255,8 +269,9 @@ class TG:
             lines += ["📋 <b>Mercado</b>: ainda não abriu", ""]
         else:
             lines += [
-                f"📋 <b>{market['title'][:40]}</b>",
-                f"  vol ${market['volume']:,.0f}  |  {market['n_outcomes']} brackets",
+                "📋 <b>Polymarket — Mercado de Hoje</b>",
+                f"  {market['title'][:60]}",
+                f"  vol: ${market['volume']:,.0f}  brackets: {market['n_outcomes']}",
                 "",
                 "<pre>",
                 f"{'Bracket':<16} {'Ask':>5}  {'Bar':8}",
@@ -268,6 +283,7 @@ class TG:
                 bar     = _tg_bar(ask_val, width=8)
                 lines.append(f"{arrow}{b['label']:<15} {ask_val*100:>4.0f}¢  {bar}")
             lines.append("</pre>")
+            lines.append("")
 
         # EV
         if bracket and ev:
@@ -309,6 +325,7 @@ class TG:
             if s["n_open"] > 0:
                 lines.append(f"  Posições abertas: {s['n_open']}")
 
+        # Rodapé
         reason_str = {
             "periodic":    "⏱ periódico",
             "zone_change": "⚡ mudança de zona",
@@ -317,6 +334,7 @@ class TG:
         lines += ["", f"<i>{reason_str}</i>"]
 
         return self.send("\n".join(lines))
+
 
     # ── Detecção de zona ──────────────────────────────
 
