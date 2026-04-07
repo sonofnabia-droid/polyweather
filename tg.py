@@ -213,7 +213,11 @@ class TG:
         now_str = datetime.now().strftime("%H:%M")
 
         lines = [
-            f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode.upper()}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
+            mode_str = str(mode).replace("TradingMode.", "").upper()
+            lines = [
+                f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode_str}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
+                ...
+            ]
             f"  Estação: <b>{forecast_max['station'] if forecast_max and 'station' in forecast_max else 'EDDM Munich Airport (WUnderground)'}</b>",
             f"  ◉ a verificar sinal (:{now_str[-2:]})",
             "  ──────────────────────────────────────────────────────────",
