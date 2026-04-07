@@ -46,7 +46,6 @@ from munich_config import (
     WU_API_KEY, POLY_PRIVATE_KEY, POLY_MAX_DAILY_LOSS,
     LOG_DIR, GAMMA_API, MONTH_NAMES,
     DAY_START, DAY_END, MIN_HOUR,
-    BOT_ACTIVE_START, BOT_ACTIVE_END,
     _SIGNAL_CHECK_WINDOWS,
     berlin_now, berlin_date, local_now, ceil_slot,
     smart_sleep,
@@ -609,12 +608,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
         while True:
             now = local_now()
 
-            # Fora do horario activo
-            if not (BOT_ACTIVE_START <= now.hour < BOT_ACTIVE_END):
-                time.sleep(60)
-                continue
-
-            # Novo dia (Berlin)
+            # Novo dia (Berlin) — corre a qualquer hora, incluindo madrugada
             station_date = berlin_date()
             if station_date != today:
                 today         = station_date
@@ -623,6 +617,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 series_today  = {}
                 obs_min_today = {}
                 temps_by_hour = {}
+                cloud_by_hour = {}
                 signals       = {}
                 peak_detected = False
                 bet_placed    = False
@@ -631,16 +626,40 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 bets_path     = LOG_DIR / f"bets_{today}.json"
                 month         = today.month
                 doy           = today.timetuple().tm_yday
-                market        = fetch_market(market_date)
+                latest_obs    = None
 
-                series_today, slots_so_far = bootstrap_today(wu_key, wu_sess)
-                obs_min_today = dict(getattr(bootstrap_today, "_obs_min", {}))
-                rows_cache    = getattr(bootstrap_today, "_rows_cache", [])
-                cloud_by_hour = cloud_from_series(series_today, rows_cache)
-                temps_by_hour = {s["hour"]: s["temp_c"] for s in slots_so_far}
+                # Tentar obter mercado com retry (pode ainda nao existir a meia-noite)
+                market = None
+                for _attempt in range(3):
+                    market = fetch_market(market_date)
+                    if market:
+                        break
+                    time.sleep(30)
+
+                # Bootstrap — pode estar vazio a meia-noite (sem obs WU ainda)
+                try:
+                    series_today, slots_so_far = bootstrap_today(wu_key, wu_sess)
+                    obs_min_today = dict(getattr(bootstrap_today, "_obs_min", {}))
+                    rows_cache    = getattr(bootstrap_today, "_rows_cache", [])
+                    cloud_by_hour = cloud_from_series(series_today, rows_cache)
+                    temps_by_hour = {s["hour"]: s["temp_c"] for s in slots_so_far}
+                except Exception as _e:
+                    print(f"  {C['yellow']}Bootstrap falhou: {_e} — a retomar no proximo tick{R}")
 
                 if market and clob:
                     market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
+
+                update_history_max(history_max, slots_so_far)
+
+                tg.alert_started(
+                    mode            = clob_mode_str,
+                    bankroll        = bankroll,
+                    threshold_arg   = threshold,
+                    threshold_month = get_threshold(today.month),
+                    month           = today.month,
+                    market          = market,
+                    today           = today,
+                )
 
             # ── Ultima leitura WU ──────────────────────
             new_obs = fetch_wu_latest(wu_key, wu_sess)
@@ -907,10 +926,14 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         time.sleep(1)
 
             # ── Smart sleep (fast-poll nas janelas EDDM) ──────────────────
-            # Fora das janelas :18-:32 / :45-:55 → dorme interval segundos.
-            # Dentro das janelas → polling a 2s ate nova temperatura ou fim da janela.
-            _last_t = latest_obs["temp_c"] if latest_obs else None
-            smart_sleep(interval, wu_key, wu_sess, _last_t)
+            # Madrugada (23h-8h hora Berlin): intervalo longo, sem polling rapido.
+            # Dia (8h-21h): intervalo normal + fast-poll nas janelas :18/:50.
+            _berlin_h = berlin_now().hour
+            _last_t   = latest_obs["temp_c"] if latest_obs else None
+            if _berlin_h < 8 or _berlin_h >= 21:
+                time.sleep(300)   # 5 min de madrugada — WU nao actualiza de noite
+            else:
+                smart_sleep(interval, wu_key, wu_sess, _last_t)
 
             # ── Dashboard periodica Telegram (30 min) ─────────────────────
             if time.time() - _tg_last_dashboard >= _tg_dashboard_interval:
