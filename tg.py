@@ -322,14 +322,11 @@ class TG:
 
         return self.send("\n".join(lines))
 
+# ─────────────────────────────────────────────────────────────
+# FUNÇÃO GLOBAL
+# ─────────────────────────────────────────────────────────────
     
-    # ─────────────────────────────────────────────────────────────
-    # FUNÇÃO GLOBAL
-    # ─────────────────────────────────────────────────────────────
     
-    def _tg_bar(p: float, width: int = 10) -> str:
-        filled = round(min(max(p, 0), 1
-    
-    def _tg_bar(p: float, width: int = 10) -> str:
-        filled = round(min(max(p, 0), 1) * width)
-        return "█" * filled + "░" * (width - filled)
+def _tg_bar(p: float, width: int = 10) -> str:
+    filled = round(min(max(p, 0), 1) * width)
+    return "█" * filled + "░" * (width - filled)
