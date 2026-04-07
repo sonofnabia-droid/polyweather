@@ -80,14 +80,19 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
-    def alert_order_placed(self, bet: dict) -> bool:
-        mode      = "REAL 💰" if not bet.get("simulated") else "PAPER 🟡"
-        icon      = "✅" if not bet.get("simulated") else "🟡"
-        ask       = bet.get("ask") or bet.get("price", 0)
-        size      = bet.get("bet_size") or bet.get("size_usd", 0)
-        shares    = bet.get("shares", 0)
-        profit    = bet.get("max_profit", 0)
-        order_id  = bet.get("order_id", "?")
+    # ✔ FIX: modo REAL/PAPER agora é sempre correto
+    def alert_order_placed(self, bet: dict, clob_mode: str = "paper") -> bool:
+        simulated = bet.get("simulated", clob_mode != "real")
+
+        mode = "PAPER 🟡" if simulated else "REAL 💰"
+        icon = "🟡" if simulated else "✅"
+
+        ask      = bet.get("ask") or bet.get("price", 0)
+        size     = bet.get("bet_size") or bet.get("size_usd", 0)
+        shares   = bet.get("shares", 0)
+        profit   = bet.get("max_profit", 0)
+        order_id = bet.get("order_id", "?")
+
         lines = [
             f"{icon} <b>Ordem colocada [{mode}]</b>",
             f"  Bracket: <b>{bet['bracket']}</b>   Ask: {ask*100:.1f}¢",
@@ -106,10 +111,6 @@ class TG:
         return self.send("\n".join(lines))
 
     def alert_position_resolved(self, pos) -> bool:
-        """
-        Enviado quando uma posição passa de OPEN → WON ou LOST.
-        pos: instância de Position do polymarket_clob.
-        """
         won      = pos.status.value == "won"
         icon     = "🏆" if won else "💸"
         result   = "GANHOU" if won else "PERDEU"
@@ -127,11 +128,6 @@ class TG:
 
     def alert_day_summary(self, day_str: str, day_positions: list,
                           cumulative_summary: dict) -> bool:
-        """
-        Resumo do dia que terminou — enviado no rollover de meia-noite.
-        day_positions : lista de Position do dia.
-        cumulative_summary : dict de pnl_summary() com totais acumulados.
-        """
         n_bets  = len(day_positions)
         n_won   = sum(1 for p in day_positions if p.status.value == "won")
         n_lost  = sum(1 for p in day_positions if p.status.value == "lost")
@@ -153,7 +149,6 @@ class TG:
                 f"  {pnl_icon} P&amp;L dia: <b>{day_pnl:+.2f}</b> ({roi:+.1f}%)",
                 "",
             ]
-            # Detalhe de cada bet do dia
             for pos in day_positions:
                 st_icon = "✅" if pos.status.value == "won" else ("❌" if pos.status.value == "lost" else "⏳")
                 pnl_s = f"{pos.pnl_usd:+.2f}" if pos.pnl_usd is not None else "?"
@@ -162,7 +157,6 @@ class TG:
                 )
             lines.append("")
 
-        # Totais acumulados
         s = cumulative_summary
         nc = s["n_won"] + s["n_lost"]
         wr_s = f"{s['n_won']/nc*100:.0f}%" if nc > 0 else "—"
@@ -176,10 +170,6 @@ class TG:
 
     def alert_stopped(self, bets: list, mode: str,
                       cumulative_summary: dict | None = None) -> bool:
-        """
-        Enviado ao parar o bot (Ctrl+C ou shutdown).
-        Se cumulative_summary for passado, inclui os totais acumulados.
-        """
         mode_label = "REAL" if mode == "real" else "PAPER"
         lines = [f"🛑 <b>Bot parado</b>  [{mode_label}]"]
 
@@ -211,9 +201,9 @@ class TG:
             f"  Agora: <b>{p*100:.0f}%</b>  ({labels[zone]})",
         ]
         return self.send("\n".join(lines))
+        # ── Dashboard periódica ────────────────────────────
 
-    # ── Dashboard periódica ────────────────────────────
-
+    # ✔ FIX: agora aceita trading_mode OU clob_mode
     def dashboard(self,
                   today,
                   p: float,
@@ -226,16 +216,15 @@ class TG:
                   ev: dict | None,
                   peak_detected: bool,
                   bet: dict | None,
-                  clob_mode: str,
+                  clob_mode: str = None,
+                  trading_mode: str = None,
                   reason: str = "periodic",
                   positions_summary: dict | None = None) -> bool:
-        """
-        Envia dashboard formatada para Telegram a cada 30 min.
-        reason: "periodic" | "zone_change" | "market_open"
-        positions_summary: resultado de clob.positions.pnl_summary() (opcional)
-        """
-        now_str   = datetime.now().strftime("%H:%M")
-        mode_icon = "🟢" if clob_mode == "real" else "🟡"
+
+        mode = trading_mode or clob_mode or "paper"
+        mode_icon = "🟢" if mode == "real" else "🟡"
+
+        now_str = datetime.now().strftime("%H:%M")
 
         lines = [
             f"{mode_icon} <b>Munich Bot</b>  {today}  {now_str}",
@@ -292,7 +281,8 @@ class TG:
 
         # Bet
         if bet:
-            sim_label = "PAPER" if bet.get("simulated") else "REAL"
+            simulated = bet.get("simulated", mode != "real")
+            sim_label = "PAPER" if simulated else "REAL"
             ask       = bet.get("ask") or bet.get("price", 0)
             size      = bet.get("bet_size") or bet.get("size_usd", 0)
             lines += [
@@ -304,7 +294,7 @@ class TG:
         else:
             lines.append("💤 Sem bet ainda")
 
-        # ── P&L acumulado ─────────────────────────────────
+        # P&L acumulado
         if positions_summary and (positions_summary["n_won"] + positions_summary["n_lost"]) > 0:
             s  = positions_summary
             nc = s["n_won"] + s["n_lost"]
@@ -319,7 +309,6 @@ class TG:
             if s["n_open"] > 0:
                 lines.append(f"  Posições abertas: {s['n_open']}")
 
-        # Rodapé
         reason_str = {
             "periodic":    "⏱ periódico",
             "zone_change": "⚡ mudança de zona",
@@ -332,14 +321,12 @@ class TG:
     # ── Detecção de zona ──────────────────────────────
 
     def p_zone(self, p: float) -> int:
-        """Zona: 0=<30%, 1=30-60%, 2=60-80%, 3=>=80%"""
         if p >= 0.80: return 3
         if p >= 0.60: return 2
         if p >= 0.30: return 1
         return 0
 
     def zone_changed(self, p: float) -> bool:
-        """True se P mudou de zona desde o último check."""
         z = self.p_zone(p)
         if z != self._last_p_zone:
             self._last_p_zone = z
@@ -347,6 +334,8 @@ class TG:
         return False
 
 
-def _tg_bar(p: float, width: int = 10) -> str:
-    filled = round(min(max(p, 0), 1) * width)
-    return "█" * filled + "░" * (width - filled)
+    def _tg_bar(p: float, width: int = 10) -> str:
+        filled = round(min(max(p, 0), 1) * width)
+        return "█" * filled + "░" * (width - filled)
+
+
