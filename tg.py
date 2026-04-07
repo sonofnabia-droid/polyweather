@@ -1,14 +1,5 @@
 """
 tg.py — Telegram notifier para o munich_live_bot.
-Uso:
-    from tg import TG
-    tg = TG()   # lê TELEGRAM_TOKEN e TELEGRAM_CHAT_ID do ambiente
-    tg.send("mensagem")
-    tg.dashboard(...)
-
-Variáveis de ambiente:
-    TELEGRAM_TOKEN   = token do bot (obtido no @BotFather)
-    TELEGRAM_CHAT_ID = o teu chat ID (obtido com @userinfobot)
 """
 
 import os
@@ -21,7 +12,7 @@ class TG:
         self.token   = os.environ.get("TELEGRAM_TOKEN", "")
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         self.enabled = bool(self.token and self.chat_id)
-        self._last_p_zone = -1   # para detectar mudança de zona
+        self._last_p_zone = -1
         if not self.enabled:
             print("  [TG] TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID nao definidos — notificacoes desactivadas")
 
@@ -38,7 +29,9 @@ class TG:
         except Exception:
             return False
 
-    # ── Alertas específicos ────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # ALERTAS
+    # ─────────────────────────────────────────────────────────────
 
     def alert_started(self, mode: str, bankroll: float,
                       threshold_arg: float, threshold_month: float,
@@ -80,10 +73,8 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
-    # ✔ FIX: modo REAL/PAPER agora é sempre correto
     def alert_order_placed(self, bet: dict, clob_mode: str = "paper") -> bool:
         simulated = bet.get("simulated", clob_mode != "real")
-
         mode = "PAPER 🟡" if simulated else "REAL 💰"
         icon = "🟡" if simulated else "✅"
 
@@ -168,31 +159,6 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
-    def alert_stopped(self, bets: list, mode: str,
-                      cumulative_summary: dict | None = None) -> bool:
-        mode_label = "REAL" if mode == "real" else "PAPER"
-        lines = [f"🛑 <b>Bot parado</b>  [{mode_label}]"]
-
-        if bets:
-            lines.append(f"  {len(bets)} ordem(s) registada(s) hoje.")
-        else:
-            lines.append("  Sem ordens hoje.")
-
-        if cumulative_summary:
-            s  = cumulative_summary
-            nc = s["n_won"] + s["n_lost"]
-            wr_s = f"{s['n_won']/nc*100:.0f}%" if nc > 0 else "—"
-            lines += [
-                "",
-                "─────────────────",
-                f"  <b>Resumo total</b>",
-                f"  {s['n_won']}W / {s['n_lost']}L   Win rate: <b>{wr_s}</b>",
-                f"  Investido: ${s['total_invested']:.2f}",
-                f"  P&amp;L: <b>{s['total_pnl_usd']:+.2f}</b> ({s['total_pnl_pct']:+.1f}%)",
-                f"  Posições abertas: {s['n_open']}",
-            ]
-        return self.send("\n".join(lines))
-
     def alert_zone_change(self, p: float, zone: int) -> bool:
         icons  = {0: "⚪", 1: "🟠", 2: "🟡", 3: "🟢"}
         labels = {0: "< 30%", 1: "30–60%", 2: "60–80%", 3: "≥ 80%"}
@@ -201,10 +167,12 @@ class TG:
             f"  Agora: <b>{p*100:.0f}%</b>  ({labels[zone]})",
         ]
         return self.send("\n".join(lines))
-        # ── Dashboard periódica ────────────────────────────
 
-    # ✔ FIX: agora aceita trading_mode OU clob_mode
-        def dashboard(self,
+    # ─────────────────────────────────────────────────────────────
+    # DASHBOARD COMPLETA
+    # ─────────────────────────────────────────────────────────────
+
+    def dashboard(self,
                   today,
                   p: float,
                   rmax: float,
@@ -222,13 +190,10 @@ class TG:
                   reason: str = "periodic",
                   positions_summary: dict | None = None) -> bool:
 
-        # Determinar modo
         mode = trading_mode or clob_mode or "paper"
         mode_icon = "🟢" if mode == "real" else "🟡"
-
         now_str = datetime.now().strftime("%H:%M")
 
-        # Cabeçalho estilo terminal
         lines = [
             f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode.upper()}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
             f"  Estação: <b>{forecast_max['station'] if forecast_max and 'station' in forecast_max else 'EDDM Munich Airport (WUnderground)'}</b>",
@@ -237,15 +202,15 @@ class TG:
             "",
         ]
 
-        # Chart ASCII (curva de temperatura)
+        # Chart ASCII
         if chart:
-            lines.append("🌡 <b>Curva de temperatura hoje</b>  (● verde=P>80% amarelo=P>60% laranja=P>30%)")
+            lines.append("🌡 <b>Curva de temperatura hoje</b>")
             lines.append("<pre>")
             lines.extend(chart)
             lines.append("</pre>")
             lines.append("")
 
-        # Temperatura atual
+        # Temperatura
         temp_str = f"{int(round(temp_now))}°C" if temp_now is not None else "—"
         fc_str   = f"   prev {forecast_max['temp_max']}°C" if forecast_max else ""
         lines += [
@@ -260,7 +225,7 @@ class TG:
         peak_str = "  ✓ <b>PICO DETECTADO</b>" if peak_detected else ""
         lines += [
             "🧠 <b>Modelo LightGBM — P(pico já ocorreu)</b>",
-            f"  {p_bar}  <b>{p*100:.1f}%</b>  threshold: 46%{peak_str}",
+            f"  {p_bar}  <b>{p*100:.1f}%</b>{peak_str}",
             "",
         ]
 
@@ -336,24 +301,10 @@ class TG:
         return self.send("\n".join(lines))
 
 
-    # ── Detecção de zona ──────────────────────────────
-
-    def p_zone(self, p: float) -> int:
-        if p >= 0.80: return 3
-        if p >= 0.60: return 2
-        if p >= 0.30: return 1
-        return 0
-
-    def zone_changed(self, p: float) -> bool:
-        z = self.p_zone(p)
-        if z != self._last_p_zone:
-            self._last_p_zone = z
-            return True
-        return False
-
+# ─────────────────────────────────────────────────────────────
+# FUNÇÃO GLOBAL
+# ─────────────────────────────────────────────────────────────
 
 def _tg_bar(p: float, width: int = 10) -> str:
-        filled = round(min(max(p, 0), 1) * width)
-        return "█" * filled + "░" * (width - filled)
-
-
+    filled = round(min(max(p, 0), 1) * width)
+    return "█" * filled + "░" * (width - filled)
