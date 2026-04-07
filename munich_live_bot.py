@@ -58,7 +58,7 @@ from munich_model import (
     load_model, predict_p, set_seasonal_prior,
     compute_prev7, init_history_max, update_history_max,
 )
-from munich_display import display, log_tick
+from munich_display import display, log_tick, draw_chart
 
 # ── Polymarket / execucao ─────────────────────────────
 from polymarket_clob import ClobClient, TradingMode, OrderBook, PositionManager, Position, PositionStatus
@@ -944,6 +944,9 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _rs  = max(series_today, key=series_today.get)
                     _obs = (obs_min_today or {}).get(_rs)
                     _rmax_ts = f"{_obs[0]}:{_obs[1]:02d}" if _obs else f"{_rs[0]}h"
+
+                chart_lines = draw_chart(series_today, signals, peak_detected, plain=True)
+
                 tg.dashboard(
                   today         = today,
                   p             = p,
@@ -955,12 +958,13 @@ def run(wu_key: str, threshold: float, bankroll: float,
                   bracket       = bracket,
                   ev            = ev,
                   peak_detected = peak_detected,
-                  bet           = bet_placed,   # ← AQUI ESTÁ A CORREÇÃO
+                  bet           = bet_placed,
                   clob_mode     = clob_mode_str,
                   trading_mode  = trading_mode,
+                  chart         = chart_lines,     # ← AQUI
                   reason        = "periodic",
-                  chart = chart_lines,
               )
+
 
     except KeyboardInterrupt:
         print(f"\n\n  {DIM}Stopped.  Logs em ./{LOG_DIR}/{R}")
