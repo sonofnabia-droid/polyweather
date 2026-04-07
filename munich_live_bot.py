@@ -959,6 +959,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                   clob_mode     = clob_mode_str,
                   trading_mode  = trading_mode,
                   reason        = "periodic",
+                  chart = chart_lines,
               )
 
     except KeyboardInterrupt:
