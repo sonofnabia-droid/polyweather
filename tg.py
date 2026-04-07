@@ -168,18 +168,17 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
-
-        # ── Detecção de zona ──────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # DETECÇÃO DE ZONA
+    # ─────────────────────────────────────────────────────────────
 
     def p_zone(self, p: float) -> int:
-        """Zona: 0=<30%, 1=30-60%, 2=60-80%, 3>=80%"""
         if p >= 0.80: return 3
         if p >= 0.60: return 2
         if p >= 0.30: return 1
         return 0
 
     def zone_changed(self, p: float) -> bool:
-        """True se P mudou de zona desde o último check."""
         z = self.p_zone(p)
         if z != self._last_p_zone:
             self._last_p_zone = z
@@ -208,16 +207,18 @@ class TG:
                   reason: str = "periodic",
                   positions_summary: dict | None = None) -> bool:
 
+        # Converter modo para string robusta
         mode = trading_mode or clob_mode or "paper"
-        mode_icon = "🟢" if mode == "real" else "🟡"
+        if hasattr(mode, "value"):
+            mode_str = mode.value.upper()
+        else:
+            mode_str = str(mode).replace("TradingMode.", "").upper()
+
+        mode_icon = "🟢" if mode_str == "REAL" else "🟡"
         now_str = datetime.now().strftime("%H:%M")
 
         lines = [
-            mode_str = str(mode).replace("TradingMode.", "").upper()
-            lines = [
-                f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode_str}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
-                ...
-            ]
+            f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode_str}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
             f"  Estação: <b>{forecast_max['station'] if forecast_max and 'station' in forecast_max else 'EDDM Munich Airport (WUnderground)'}</b>",
             f"  ◉ a verificar sinal (:{now_str[-2:]})",
             "  ──────────────────────────────────────────────────────────",
@@ -243,7 +244,6 @@ class TG:
 
         # Modelo
         p_bar  = _tg_bar(p, width=10)
-        p_icon = "🟢" if p >= 0.80 else ("🟡" if p >= 0.60 else ("🟠" if p >= 0.30 else "⚪"))
         peak_str = "  ✓ <b>PICO DETECTADO</b>" if peak_detected else ""
         lines += [
             "🧠 <b>Modelo LightGBM — P(pico já ocorreu)</b>",
@@ -284,7 +284,7 @@ class TG:
 
         # Bet
         if bet:
-            simulated = bet.get("simulated", mode != "real")
+            simulated = bet.get("simulated", mode_str != "REAL")
             sim_label = "PAPER" if simulated else "REAL"
             ask       = bet.get("ask") or bet.get("price", 0)
             size      = bet.get("bet_size") or bet.get("size_usd", 0)
@@ -322,11 +322,11 @@ class TG:
 
         return self.send("\n".join(lines))
 
-
-# ─────────────────────────────────────────────────────────────
-# FUNÇÃO GLOBAL
-# ─────────────────────────────────────────────────────────────
-
-def _tg_bar(p: float, width: int = 10) -> str:
-    filled = round(min(max(p, 0), 1) * width)
-    return "█" * filled + "░" * (width - filled)
+    
+    # ─────────────────────────────────────────────────────────────
+    # FUNÇÃO GLOBAL
+    # ─────────────────────────────────────────────────────────────
+    
+    def _tg_bar(p: float, width: int = 10) -> str:
+        filled = round(min(max(p, 0), 1
+    
