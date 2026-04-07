@@ -945,22 +945,21 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _obs = (obs_min_today or {}).get(_rs)
                     _rmax_ts = f"{_obs[0]}:{_obs[1]:02d}" if _obs else f"{_rs[0]}h"
                 tg.dashboard(
-                    today         = today,
-                    p             = p,
-                    rmax          = rmax,
-                    rmax_time     = _rmax_ts,
-                    temp_now      = latest_obs["temp_c"] if latest_obs else None,
-                    forecast_max  = forecast_max,
-                    market        = market,
-                    bracket       = bracket,
-                    ev            = ev,
-                    peak_detected = peak_detected,
-                    bet           = bets[-1] if bets else None,
-                    clob_mode     = clob_mode_str,
-                    trading_mode  = trading_mode,
-                    bet_placed    = bet_placed,
-                    reason        = "periodic",
-                )
+                  today         = today,
+                  p             = p,
+                  rmax          = rmax,
+                  rmax_time     = _rmax_ts,
+                  temp_now      = latest_obs["temp_c"] if latest_obs else None,
+                  forecast_max  = forecast_max,
+                  market        = market,
+                  bracket       = bracket,
+                  ev            = ev,
+                  peak_detected = peak_detected,
+                  bet           = bet_placed,   # ← AQUI ESTÁ A CORREÇÃO
+                  clob_mode     = clob_mode_str,
+                  trading_mode  = trading_mode,
+                  reason        = "periodic",
+              )
 
     except KeyboardInterrupt:
         print(f"\n\n  {DIM}Stopped.  Logs em ./{LOG_DIR}/{R}")
