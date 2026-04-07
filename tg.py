@@ -168,6 +168,24 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
+
+        # ── Detecção de zona ──────────────────────────────
+
+    def p_zone(self, p: float) -> int:
+        """Zona: 0=<30%, 1=30-60%, 2=60-80%, 3>=80%"""
+        if p >= 0.80: return 3
+        if p >= 0.60: return 2
+        if p >= 0.30: return 1
+        return 0
+
+    def zone_changed(self, p: float) -> bool:
+        """True se P mudou de zona desde o último check."""
+        z = self.p_zone(p)
+        if z != self._last_p_zone:
+            self._last_p_zone = z
+            return True
+        return False
+
     # ─────────────────────────────────────────────────────────────
     # DASHBOARD COMPLETA
     # ─────────────────────────────────────────────────────────────
