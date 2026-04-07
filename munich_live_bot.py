@@ -723,7 +723,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _rts = "?"
                 tg.alert_peak_detected(p, _rm, _rts, bracket if 'bracket' in dir() else None)
 
-            if tg.zone_changed(p):
+            # Alertas de zona apenas antes de bet colocada — depois e ruido
+            if not bet_placed and tg.zone_changed(p):
                 tg.alert_zone_change(p, tg.p_zone(p))
 
             # ── Actualizar mercado + forecast periodicamente ──
@@ -956,6 +957,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     peak_detected = peak_detected,
                     bet           = bets[-1] if bets else None,
                     clob_mode     = clob_mode_str,
+                    trading_mode  = trading_mode,
+                    bet_placed    = bet_placed,
                     reason        = "periodic",
                 )
 
