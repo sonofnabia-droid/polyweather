@@ -55,13 +55,17 @@ def risk_bar(used_pct: float) -> str:
 # ══════════════════════════════════════════════════════
 
 def draw_chart(series_today: dict, signals: dict,
-               peak_detected: bool) -> list[str]:
+               peak_detected: bool,
+               plain: bool = False) -> list[str]:
+    """
+    plain=True → remove cores ANSI (para Telegram)
+    """
     lines = []
     slots = [(h, m) for h in range(DAY_START, DAY_END + 1) for m in (0, 30)]
     temps = [series_today.get(s) for s in slots]
     avail = [t for t in temps if t is not None]
     if not avail:
-        return [f"  {DIM}sem dados para grafico{R}"]
+        return ["  sem dados para grafico"]
 
     t_min  = min(avail) - 0.5
     t_max  = max(avail) + 0.5
@@ -72,6 +76,7 @@ def draw_chart(series_today: dict, signals: dict,
 
     grid = [[" "] * total_w for _ in range(chart_h)]
 
+    # Eixo Y
     for row in range(chart_h):
         t_val = t_max - (row / (chart_h - 1)) * t_rng
         label = f"{int(round(t_val)):>3}°"
@@ -79,43 +84,65 @@ def draw_chart(series_today: dict, signals: dict,
             if ci < 4:
                 grid[row][ci] = ch
 
+    # Linha base
     for ci in range(4, total_w):
         grid[chart_h - 1][ci] = "─"
 
     def to_row(t):
         return int((1 - (t - t_min) / t_rng) * (chart_h - 1))
 
+    # Plot
     for si, ((h, m), temp) in enumerate(zip(slots, temps)):
         if temp is None:
             continue
         row = to_row(temp)
         col = 4 + si * col_w
         p   = signals.get(h, 0)
-        if p >= 0.80:   sym = f"{C['green']}██{R}"
-        elif p >= 0.60: sym = f"{C['yellow']}██{R}"
-        elif p >= 0.30: sym = f"{C['orange']}▓▓{R}"
-        else:            sym = f"{DIM}▒▒{R}"
+
+        if plain:
+            # versão Telegram (sem cores)
+            if p >= 0.80:   sym = "██"
+            elif p >= 0.60: sym = "▓▓"
+            elif p >= 0.30: sym = "▒▒"
+            else:           sym = "░░"
+        else:
+            # versão terminal (com cores)
+            if p >= 0.80:   sym = f"{C['green']}██{R}"
+            elif p >= 0.60: sym = f"{C['yellow']}██{R}"
+            elif p >= 0.30: sym = f"{C['orange']}▓▓{R}"
+            else:           sym = f"{DIM}▒▒{R}"
+
         if 0 <= row < chart_h - 1:
             grid[row][col]     = sym
             grid[row][col + 1] = ""
 
+    # Converter grid em linhas
     for row in grid:
         lines.append("  " + "".join(row))
 
+    # Eixo X
     x_line = "  " + " " * 4
     for h in range(DAY_START, DAY_END + 1):
         x_line += f"{h:<4}"
-    lines.append(f"{DIM}{x_line}{R}")
+    lines.append(x_line)
 
+    # Linha P(pico)
     p_line = "  " + " " * 4
     for h in range(DAY_START, DAY_END + 1):
         pv = signals.get(h, 0)
-        if pv >= 0.80:   cell = f"{C['green']}▓▓{R}  "
-        elif pv >= 0.60: cell = f"{C['yellow']}▒▒{R}  "
-        elif pv >= 0.30: cell = f"{C['orange']}░░{R}  "
-        else:             cell = f"{DIM}  {R}  "
+        if plain:
+            if pv >= 0.80:   cell = "▓▓  "
+            elif pv >= 0.60: cell = "▒▒  "
+            elif pv >= 0.30: cell = "░░  "
+            else:            cell = "    "
+        else:
+            if pv >= 0.80:   cell = f"{C['green']}▓▓{R}  "
+            elif pv >= 0.60: cell = f"{C['yellow']}▒▒{R}  "
+            elif pv >= 0.30: cell = f"{C['orange']}░░{R}  "
+            else:            cell = f"{DIM}  {R}  "
         p_line += cell
-    lines.append(p_line + f" {DIM}P(pico){R}")
+
+    lines.append(p_line + " P(pico)")
 
     return lines
 
