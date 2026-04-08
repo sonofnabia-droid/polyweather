@@ -58,7 +58,7 @@ from munich_model import (
     load_model, predict_p, set_seasonal_prior,
     compute_prev7, init_history_max, update_history_max,
 )
-from munich_display import display, log_tick, draw_chart
+from munich_display import display, log_tick
 
 # ── Polymarket / execucao ─────────────────────────────
 from polymarket_clob import ClobClient, TradingMode, OrderBook, PositionManager, Position, PositionStatus
@@ -244,7 +244,10 @@ def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
     EV e edge continuam a ser calculados e mostrados no dashboard como info.
     """
     ask      = ask_price if (ask_price := (bracket.get("ask") or bracket.get("price"))) else (ev["ask"] if ev else 0)
-    bet_size = round(min(max_daily_loss, bankroll * 0.10), 2)  # nunca mais de 10% do bankroll
+    if mode == TradingMode.REAL:
+        bet_size = 5.0   # REAL: sempre $5 fixos, sem dinamica
+    else:
+        bet_size = round(min(max_daily_loss, bankroll * 0.10), 2)
     shares   = round(bet_size / ask, 4) if ask > 0 else 0
     ev_cents  = ev["ev_cents"] if ev else None
     edge_pct  = ev["edge_pct"] if ev else None
@@ -663,10 +666,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
             # ── Ultima leitura WU ──────────────────────
             new_obs = fetch_wu_latest(wu_key, wu_sess)
-            # Se WU falhar, manter a última leitura
-            if new_obs is None:
-                new_obs = latest_obs
-            else:
+            if new_obs:
                 latest_obs = new_obs
                 h_obs, m_obs = new_obs["hour"], new_obs["minute"]
                 h_slot, s30  = ceil_slot(h_obs, m_obs)
@@ -947,33 +947,23 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _rs  = max(series_today, key=series_today.get)
                     _obs = (obs_min_today or {}).get(_rs)
                     _rmax_ts = f"{_obs[0]}:{_obs[1]:02d}" if _obs else f"{_rs[0]}h"
-
-                chart_lines = draw_chart(series_today, signals, peak_detected, plain=True)
-
-                # heartbeat: enviar dashboard mesmo sem leitura WU
-                force_dashboard = (time.time() - _tg_last_dashboard > _tg_dashboard_interval)
-
-                if new_obs or force_dashboard:
-                  tg.dashboard(
-                      today         = today,
-                      p             = p,
-                      rmax          = rmax,
-                      rmax_time     = _rmax_ts,
-                      temp_now      = latest_obs["temp_c"] if latest_obs else None,
-                      forecast_max  = forecast_max,
-                      market        = market,
-                      bracket       = bracket,
-                      ev            = ev,
-                      peak_detected = peak_detected,
-                      bet           = bet_placed,
-                      clob_mode     = clob_mode_str,
-                      trading_mode  = trading_mode,
-                      chart         = chart_lines,
-                      reason        = "periodic",
-                  )
-                  _tg_last_dashboard = time.time()
-
-
+                tg.dashboard(
+                    today         = today,
+                    p             = p,
+                    rmax          = rmax,
+                    rmax_time     = _rmax_ts,
+                    temp_now      = latest_obs["temp_c"] if latest_obs else None,
+                    forecast_max  = forecast_max,
+                    market        = market,
+                    bracket       = bracket,
+                    ev            = ev,
+                    peak_detected = peak_detected,
+                    bet           = bets[-1] if bets else None,
+                    clob_mode     = clob_mode_str,
+                    trading_mode  = trading_mode,
+                    bet_placed    = bet_placed,
+                    reason        = "periodic",
+                )
 
     except KeyboardInterrupt:
         print(f"\n\n  {DIM}Stopped.  Logs em ./{LOG_DIR}/{R}")
