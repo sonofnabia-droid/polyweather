@@ -663,7 +663,10 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
             # ── Ultima leitura WU ──────────────────────
             new_obs = fetch_wu_latest(wu_key, wu_sess)
-            if new_obs:
+            # Se WU falhar, manter a última leitura
+            if new_obs is None:
+                new_obs = latest_obs
+            else:
                 latest_obs = new_obs
                 h_obs, m_obs = new_obs["hour"], new_obs["minute"]
                 h_slot, s30  = ceil_slot(h_obs, m_obs)
@@ -947,23 +950,29 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 chart_lines = draw_chart(series_today, signals, peak_detected, plain=True)
 
-                tg.dashboard(
-                  today         = today,
-                  p             = p,
-                  rmax          = rmax,
-                  rmax_time     = _rmax_ts,
-                  temp_now      = latest_obs["temp_c"] if latest_obs else None,
-                  forecast_max  = forecast_max,
-                  market        = market,
-                  bracket       = bracket,
-                  ev            = ev,
-                  peak_detected = peak_detected,
-                  bet           = bet_placed,
-                  clob_mode     = clob_mode_str,
-                  trading_mode  = trading_mode,
-                  chart         = chart_lines,     # ← AQUI
-                  reason        = "periodic",
-              )
+                # heartbeat: enviar dashboard mesmo sem leitura WU
+                force_dashboard = (time.time() - _tg_last_dashboard > _tg_dashboard_interval)
+
+                if new_obs or force_dashboard:
+                  tg.dashboard(
+                      today         = today,
+                      p             = p,
+                      rmax          = rmax,
+                      rmax_time     = _rmax_ts,
+                      temp_now      = latest_obs["temp_c"] if latest_obs else None,
+                      forecast_max  = forecast_max,
+                      market        = market,
+                      bracket       = bracket,
+                      ev            = ev,
+                      peak_detected = peak_detected,
+                      bet           = bet_placed,
+                      clob_mode     = clob_mode_str,
+                      trading_mode  = trading_mode,
+                      chart         = chart_lines,
+                      reason        = "periodic",
+                  )
+                  _tg_last_dashboard = time.time()
+
 
 
     except KeyboardInterrupt:
