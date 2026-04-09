@@ -608,30 +608,30 @@ class ClobClient:
     # ── Saldo ──────────────────────────────────────────
 
     def get_usdc_balance(self) -> float | None:
-      """
-      Saldo USDC disponível — lê sig_type 0,1,2 e devolve o maior.
-      O saldo util para ordens esta tipicamente em sig_type=2.
-      """
-      try:
-          from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-          best = 0.0
-          for sig in [0, 1, 2]:
-              try:
-                  info = self._client.get_balance_allowance(
-                      params=BalanceAllowanceParams(
-                          asset_type=AssetType.COLLATERAL,
-                          signature_type=sig,
-                      )
-                  )
-                  bal = int(info.get("balance", "0")) / 1e6
-                  if bal > best:
-                      best = bal
-              except Exception:
-                  pass
-          return best if best > 0 else None
-      except Exception as e:
-          logger.warning("get_usdc_balance falhou: %s", e)
-          return None
+        """
+        Saldo USDC disponivel — le sig_type 0,1,2 e devolve o maior.
+        O saldo util para ordens esta tipicamente em sig_type=2.
+        """
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            best = 0.0
+            for sig in [0, 1, 2]:
+                try:
+                    info = self._client.get_balance_allowance(
+                        params=BalanceAllowanceParams(
+                            asset_type=AssetType.COLLATERAL,
+                            signature_type=sig,
+                        )
+                    )
+                    bal = int(info.get("balance", "0")) / 1e6
+                    if bal > best:
+                        best = bal
+                except Exception:
+                    pass
+            return best if best > 0 else None
+        except Exception as e:
+            logger.warning("get_usdc_balance falhou: %s", e)
+            return None
 
     # ── Logging ────────────────────────────────────────
 
