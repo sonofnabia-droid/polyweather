@@ -8,12 +8,13 @@ Modos:
   REAL  — envia ordens reais ao Polymarket CLOB via py-clob-client
           requer confirmacao manual (y/n) + stop-loss diario
 
-Arranque:
-  1. Pergunta interactiva: Paper ou Real?
-  2. Bootstrap historico de hoje via WU API (EDDM, desde 00:00)
-  3. Aplica LightGBM a toda a serie historica
-  4. Loop (cada 60s): nova leitura WU + modelo + dashboard
-     Nas janelas :18-:32 e :45-:55 (hora Berlim): polling a 2s ate nova temp.
+Estrategia de Entrada (3 Fases com Dupla Condicao):
+  1. INICIAL: As 10:00 Berlin, se o Mercado confirmar (ask entre 10¢ e 90¢)
+  2. AMARELO: Quando P(pico) >= 60%, se o Mercado confirmar
+  3. VERDE:   Quando P(pico) >= 80%, se o Mercado confirmar
+  
+  Cada fase aposta $5.50. Total maximo por dia: $16.50.
+  A "Confirmacao do Mercado" evita comprar a 99¢ (sem edge) ou a 1¢ (mercado descarta).
 
 Instalacao:
     pip install requests pandas numpy scikit-learn lightgbm joblib py-clob-client
@@ -28,7 +29,7 @@ Variaveis opcionais:
 Uso:
     python munich_live_bot.py
     python munich_live_bot.py --threshold 0.80
-    python munich_live_bot.py --bankroll 200 --kelly 0.5 --min-edge 5
+    python munich_live_bot.py --bankroll 200 --min-edge 5
 """
 
 import argparse
@@ -37,6 +38,7 @@ import re as _re
 import sys
 import time
 from datetime import date, datetime, timedelta
+from enum import IntFlag
 
 import requests
 
@@ -64,6 +66,20 @@ from munich_display import display, log_tick
 from polymarket_clob import ClobClient, TradingMode, OrderBook, PositionManager, Position, PositionStatus
 from polymarket_orders import OrderExecutor, paper_buy
 from tg import TG
+
+
+# ══════════════════════════════════════════════════════
+#  SISTEMA DE 3 FASES DE APOSTA
+# ══════════════════════════════════════════════════════
+
+class BetPhase(IntFlag):
+    NONE     = 0      # nenhuma aposta
+    INITIAL  = 1      # 10:00 / início do dia → $5.50
+    YELLOW   = 2      # P >= 60% (amarelo) → $5.50
+    GREEN    = 4      # P >= 80% (verde) → $5.50
+    DONE     = 7      # todas colocadas
+
+BET_SIZE_PER_PHASE = 5.50
 
 
 # ══════════════════════════════════════════════════════
@@ -98,6 +114,82 @@ def get_real_usdc_balance(private_key: str) -> float | None:
         return best if best > 0 else None
     except Exception:
         return None
+
+
+# ══════════════════════════════════════════════════════
+#  DUPLA CONDIÇÃO: VALIDAÇÃO DE MERCADO
+# ══════════════════════════════════════════════════════
+def market_confirms_bracket(bracket: dict | None, min_ask: float = 0.10, max_ask: float = 0.90) -> tuple[bool, str]:
+    """
+    Verifica se o mercado oferece liquidez e preço razoável (Edge).
+    
+    Condições de FAIL (mercado NÃO confirma):
+      - ask < min_ask: mercado diz que é quase impossível (ex: ask a 1¢)
+      - ask > max_ask: mercado já sabe que é este (ex: ask a 99¢, sem edge)
+      - sem bid ou sem ask: order book vazio, não há liquidez
+    """
+    if not bracket:
+        return False, "sem bracket"
+    
+    ask = bracket.get("ask") or bracket.get("price")
+    bid = bracket.get("bid")
+    
+    if ask is None:
+        return False, "ask indisponivel"
+    
+    if bid is None or bid <= 0:
+        return False, "sem liquidez (sem bid)"
+    
+    if ask < min_ask:
+        return False, f"ask {ask*100:.1f}¢ muito baixo (mercado descarta)"
+    
+    if ask > max_ask:
+        return False, f"ask {ask*100:.1f}¢ muito alto (sem edge)"
+    
+    return True, f"ask {ask*100:.1f}¢ OK"
+
+
+def find_best_value_bracket(market: dict, temp: float, max_ask: float = 0.90) -> dict | None:
+    """
+    Em vez de apanhar só o bracket exato da temperatura atual,
+    procura o bracket com MELHOR EDGE onde o mercado ainda está barato
+    e é próximo da temperatura real.
+    """
+    if not market:
+        return None
+    
+    best_bracket = None
+    best_score = -999
+    
+    for b in market["brackets"]:
+        ask = b.get("ask") or b.get("price") or 1.0
+        
+        # Ignorar se o mercado já resolveu ou não há liquidez
+        if ask >= max_ask or ask <= 0.01:
+            continue
+            
+        bid = b.get("bid")
+        if not bid or bid <= 0:
+            continue
+            
+        lo, hi = b["temp_lo"], b["temp_hi"]
+        
+        # Pontuação de proximidade
+        if lo <= temp <= hi:
+            proximity = 1.0  # Match exato
+        elif abs(temp - lo) <= 1.5 or abs(temp - hi) <= 1.5:
+            proximity = 0.5  # Adjacente próximo
+        else:
+            proximity = 0.0  # Longe demais
+            
+        # Score = Proximidade × (1 - Ask). Ask baixo + perto = melhor score
+        score = proximity * (1.0 - ask)
+        
+        if score > best_score:
+            best_score = score
+            best_bracket = b
+            
+    return best_bracket
 
 
 # ══════════════════════════════════════════════════════
@@ -185,11 +277,7 @@ def fetch_market(d: date) -> dict | None:
         outcomes  = m.get("outcomes",    "[]")
         prices    = m.get("outcomePrices","[]")
         token_ids = m.get("clobTokenIds","[]")
-        for attr in ["outcomes", "prices", "token_ids"]:
-            pass  # parsed below
-        for x_name, x_val in [("outcomes", outcomes), ("prices", prices), ("token_ids", token_ids)]:
-            pass
-        # parse JSON strings
+        
         def _jload(x):
             if isinstance(x, str):
                 try: return json.loads(x)
@@ -248,13 +336,9 @@ def find_bracket(market: dict, temp: float) -> dict | None:
 
 
 def compute_ev(p: float, ask: float) -> dict | None:
-    """EV calculado sobre o ask do CLOB.
-
-    Retorna None se ask >= 0.95 — nesse caso o mercado esta praticamente
-    resolvido e os numeros (Kelly, edge) seriam enganadores.
-    """
+    """EV calculado sobre o ask do CLOB."""
     if not ask or not (0 < ask < 1): return None
-    if ask >= 0.95: return None          # mercado resolvido, nao calcular
+    if ask >= 0.95: return None
     ev    = p - ask
     b     = (1 - ask) / ask
     kelly = max(0.0, (p * b - (1 - p)) / b)
@@ -269,24 +353,22 @@ def compute_ev(p: float, ask: float) -> dict | None:
 
 
 def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
-                     max_daily_loss: float = 10.0) -> dict:
+                     max_daily_loss: float = 10.0, phase_name: str = "UNKNOWN") -> dict:
     """
-    Sizing: Risk-First.
-    A aposta e sempre max_daily_loss — o maximo que estamos dispostos a perder.
-    Kelly foi removido: nao e calibrado para P(bracket ganha), apenas para
-    P(pico ja ocorreu), o que gera sizes incorrectos neste contexto.
-    EV e edge continuam a ser calculados e mostrados no dashboard como info.
+    Sizing: Fixo em BET_SIZE_PER_PHASE ($5.50).
+    A dupla condicao (modelo + mercado) garante que so entramos quando ha edge.
     """
     ask      = ask_price if (ask_price := (bracket.get("ask") or bracket.get("price"))) else (ev["ask"] if ev else 0)
-    if mode == TradingMode.REAL:
-        bet_size = 5.0   # REAL: sempre $5 fixos, sem dinamica
-    else:
-        bet_size = round(min(max_daily_loss, bankroll * 0.10), 2)
+    
+    # Tamanho fixo por fase
+    bet_size = BET_SIZE_PER_PHASE
+    
     shares   = round(bet_size / ask, 4) if ask > 0 else 0
     ev_cents  = ev["ev_cents"] if ev else None
     edge_pct  = ev["edge_pct"] if ev else None
     return {
         "mode":         mode.value,
+        "phase":        phase_name,
         "bracket":      bracket["label"],
         "token_id":     bracket.get("token_id"),
         "ask":          round(ask, 4),
@@ -295,7 +377,7 @@ def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
         "p_true":       round(p, 3),
         "ev_cents":     ev_cents,
         "edge_pct":     edge_pct,
-        "sizing":       "risk_first",
+        "sizing":       "fixed_phase",
         "max_daily_loss": max_daily_loss,
         "bet_size":     bet_size,
         "shares":       shares,
@@ -334,7 +416,7 @@ def execute_forced_entry(bracket, ask_price, p, ev,
                          bankroll, kelly_frac,
                          trading_mode, executor, market,
                          bets, bets_path) -> tuple:
-    """Executa entrada forcada — ignora peak_detected e bet_placed."""
+    """Executa entrada forcada — ignora fases, modelo e mercado."""
     if not bracket or not ask_price or not ev:
         return None, "sem bracket ou preco disponivel"
 
@@ -348,7 +430,8 @@ def execute_forced_entry(bracket, ask_price, p, ev,
         if ans != "s":
             return None, "cancelado pelo utilizador"
 
-    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, max_daily_loss=POLY_MAX_DAILY_LOSS)
+    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, 
+                                  max_daily_loss=POLY_MAX_DAILY_LOSS, phase_name="FORCED")
 
     if trading_mode == TradingMode.PAPER:
         result = paper_buy(
@@ -387,6 +470,7 @@ def ask_trading_mode() -> TradingMode:
     print(f"\n  {B}{C['cyan']}── Munich Live Bot — Seleccao de Modo ──────────{R}")
     print(f"  {C['yellow']}[P]{R} PAPER  — simula ordens, order book real do CLOB")
     print(f"  {C['red']}[R]{R} REAL   — envia ordens reais ao Polymarket CLOB")
+    print(f"  {DIM}Estrategia: 3 Fases ($5.50 cada) com Dupla Condicao{R}")
     print()
 
     while True:
@@ -462,8 +546,9 @@ def ask_trading_mode() -> TradingMode:
 
 
 def confirm_real_order(bet: dict) -> bool:
+    phase_str = f" [{bet.get('phase', '')}]" if bet.get('phase') else ""
     print(f"\n  {C['red']}{B}{'═'*46}{R}")
-    print(f"  {C['red']}{B}  ⚠  CONFIRMAR ORDEM REAL  ⚠{R}")
+    print(f"  {C['red']}{B}  ⚠  CONFIRMAR ORDEM REAL{phase_str}  ⚠{R}")
     print(f"  {C['red']}{B}{'═'*46}{R}")
     print(f"    Bracket : {bet['bracket']}")
     print(f"    Ask     : {bet['ask']*100:.1f}¢  (spread {bet.get('spread', 0)*100:.1f}¢)")
@@ -550,11 +635,13 @@ def run(wu_key: str, threshold: float, bankroll: float,
     mode_label = f"{C['yellow']}PAPER{R}" if trading_mode == TradingMode.PAPER else f"{C['red']}REAL{R}"
     print(f"  Modo      : {mode_label}")
     print(f"  Threshold : {threshold*100:.0f}%   Min edge: {min_edge}%")
+    print(f"  Estrategia: {B}3 Fases${R} (${BET_SIZE_PER_PHASE:.2f} cada = ${BET_SIZE_PER_PHASE*3:.2f} max/dia)")
+    print(f"  Filtros   : Dupla Condicao (Modelo + Mercado Edge 10¢-90¢)")
     if trading_mode == TradingMode.REAL:
-        print(f"  Bankroll  : {C['green']}{B}${bankroll:.2f} USDC{R}  {DIM}(saldo real){R}   Kelly: x{kelly_frac}")
+        print(f"  Bankroll  : {C['green']}{B}${bankroll:.2f} USDC{R}  {DIM}(saldo real){R}")
         print(f"  Stop-loss : ${POLY_MAX_DAILY_LOSS:.0f} USDC/dia")
     else:
-        print(f"  Bankroll  : ${bankroll:.2f}   Kelly: x{kelly_frac}  {DIM}(simulado){R}")
+        print(f"  Bankroll  : ${bankroll:.2f}  {DIM}(simulado){R}")
     print(f"  Intervalo : {interval}s  |  Fast-poll nas janelas :18-:32 e :45-:55 (Berlin)")
     print()
 
@@ -644,7 +731,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "minute":      last["slot30"],
         }
 
-    bet_placed = False
+    # ── ESTADO DE FASES (Substitui o antigo bet_placed) ──
+    phases_done: BetPhase = BetPhase.NONE
     bets: list  = []
 
     try:
@@ -663,7 +751,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 cloud_by_hour = {}
                 signals       = {}
                 peak_detected = False
-                bet_placed    = False
+                phases_done   = BetPhase.NONE  # Reset das 3 fases
                 bets          = []
                 log_path      = LOG_DIR / f"live_{today}.csv"
                 bets_path     = LOG_DIR / f"bets_{today}.json"
@@ -671,7 +759,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 doy           = today.timetuple().tm_yday
                 latest_obs    = None
 
-                # Tentar obter mercado com retry (pode ainda nao existir a meia-noite)
+                # Tentar obter mercado com retry
                 market = None
                 for _attempt in range(3):
                     market = fetch_market(market_date)
@@ -679,7 +767,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         break
                     time.sleep(30)
 
-                # Bootstrap — pode estar vazio a meia-noite (sem obs WU ainda)
                 try:
                     series_today, slots_so_far = bootstrap_today(wu_key, wu_sess)
                     obs_min_today = dict(getattr(bootstrap_today, "_obs_min", {}))
@@ -764,10 +851,9 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 else:
                     _rm  = 0
                     _rts = "?"
-                tg.alert_peak_detected(p, _rm, _rts, bracket if 'bracket' in dir() else None)
+                tg.alert_peak_detected(p, _rm, _rts, None)
 
-            # Alertas de zona apenas antes de bet colocada — depois e ruido
-            if not bet_placed and tg.zone_changed(p):
+            if not (phases_done & BetPhase.GREEN) and tg.zone_changed(p):
                 tg.alert_zone_change(p, tg.p_zone(p))
 
             # ── Actualizar mercado + forecast periodicamente ──
@@ -796,14 +882,24 @@ def run(wu_key: str, threshold: float, bankroll: float,
             else:
                 rmax = 0
 
-            eff_thr = get_threshold(month)
-
-            if market_date != today and forecast_max and forecast_max.get("temp_max") is not None:
+            # FIX CRÍTICO: Garantir que bracket_temp tem sempre um valor válido
+            # (No código antigo, se series_today e forecast_max fossem None, dava erro)
+            if forecast_max and forecast_max.get("temp_max") is not None:
                 bracket_temp = float(forecast_max["temp_max"])
+            elif rmax > 0:
+                bracket_temp = float(rmax)
             else:
-                bracket_temp = rmax
-
+                bracket_temp = 15.0 # Fallback seguro
+                
             bracket = find_bracket(market, bracket_temp) if market else None
+
+            # ── DUPLA CONDIÇÃO: BUSCA DINÂMICA ─────────
+            # Se o mercado não confirmar o bracket exato (ex: ask a 99.8¢), 
+            # procurar o bracket adjacente com melhor edge.
+            if bracket:
+                mkt_ok_exact, _ = market_confirms_bracket(bracket)
+                if not mkt_ok_exact:
+                    bracket = find_best_value_bracket(market, rmax if rmax > 0 else bracket_temp)
 
             if bracket and clob and not bracket.get("book"):
                 bracket = clob.enrich_bracket(bracket)
@@ -815,60 +911,81 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
                 open_orders  = executor.get_open_orders() if executor else None
 
+            # ══════════════════════════════════════════
+            #  LÓGICA DE 3 APOSTAS (DUPLO FILTRO)
+            # ══════════════════════════════════════════
             bet                = None
             bet_blocked_reason = None
+            new_bet_placed     = False
 
-            if not bet_placed:
-                if trading_mode == TradingMode.REAL and clob and clob.stop_loss_triggered():
-                    bet_blocked_reason = (f"stop-loss diario atingido "
-                                         f"(${clob.daily_loss():.2f} >= ${POLY_MAX_DAILY_LOSS:.0f})")
+            # 1. Validar Mercado (aplica a todas as fases)
+            mkt_ok, mkt_reason = market_confirms_bracket(bracket)
 
-                elif not peak_detected:
-                    # peak_detected ainda nao foi ativado
-                    bet_blocked_reason = f"pico nao detectado (P={p*100:.0f}% < {eff_thr*100:.0f}%)"
+            # Stop-loss bloqueia tudo
+            if trading_mode == TradingMode.REAL and clob and clob.stop_loss_triggered():
+                bet_blocked_reason = (f"stop-loss diario atingido "
+                                     f"(${clob.daily_loss():.2f} >= ${POLY_MAX_DAILY_LOSS:.0f})")
+            elif not market:
+                bet_blocked_reason = "sem mercado Polymarket"
+            elif not bracket:
+                bet_blocked_reason = "bracket nao identificado"
+            elif phases_done == BetPhase.DONE:
+                pass # Silencioso, dia completo
+            else:
+                # 2. Verificar Triggers (Modelo) + Condição de Mercado
+                berlin_h = berlin_now().hour
+                berlin_m = berlin_now().minute
+                
+                phase_to_execute = None
+                phase_label = ""
+                phase_name = ""
 
-                elif not market:
-                    bet_blocked_reason = "sem mercado Polymarket"
+                # Prioridade: VERDE > AMARELO > INICIAL (para não saltar fases)
+                if not (phases_done & BetPhase.GREEN) and p >= 0.80 and mkt_ok:
+                    phase_to_execute = BetPhase.GREEN
+                    phase_label = f"{C['green']}VERDE (P>80%){R}"
+                    phase_name = "GREEN"
+                elif not (phases_done & BetPhase.YELLOW) and p >= 0.60 and mkt_ok:
+                    phase_to_execute = BetPhase.YELLOW
+                    phase_label = f"{C['yellow']}AMARELO (P>60%){R}"
+                    phase_name = "YELLOW"
+                elif not (phases_done & BetPhase.INITIAL) and berlin_h >= 10 and mkt_ok:
+                    phase_to_execute = BetPhase.INITIAL
+                    phase_label = f"{C['cyan']}INICIAL (10:00){R}"
+                    phase_name = "INITIAL"
 
-                elif not bracket:
-                    bet_blocked_reason = "bracket nao identificado"
-
-                # NOTA: sem check p < eff_thr aqui.
-                # peak_detected e memoria irreversivel — uma vez que o modelo
-                # ultrapassou o threshold num tick, a aposta pode ser feita mesmo
-                # que p oscile abaixo nos ticks seguintes.
-
-                elif ask_price and ask_price >= 0.95:
-                    # Mercado praticamente fechado — bloquear silenciosamente.
-                    # Para passar para amanha usa override manual ('f' + Enter).
-                    bet_blocked_reason = (f"ask {ask_price*100:.1f}¢ >= 95¢ "
-                                         f"(mercado resolvido) — usa 'f' para override")
-
-                elif not ask_price:
-                    bet_blocked_reason = "ask nao disponivel"
-
+                if phase_to_execute is None:
+                    # Determinar a razão exata do bloqueio para o dashboard
+                    if not mkt_ok:
+                        bet_blocked_reason = f"MERCADO RECUSA: {mkt_reason}"
+                    elif not (phases_done & BetPhase.INITIAL) and berlin_h < 10:
+                        bet_blocked_reason = f"aguardar 10:00 Berlin (agora {berlin_h}:{berlin_m:02d})"
+                    elif not (phases_done & BetPhase.GREEN) and p < 0.80:
+                        bet_blocked_reason = f"aguardar zona verde (P={p*100:.0f}% < 80%)"
+                    elif not (phases_done & BetPhase.YELLOW) and p < 0.60:
+                        bet_blocked_reason = f"aguardar zona amarela (P={p*100:.0f}% < 60%)"
                 else:
-                    # ── Executar bet ──────────────────
-                    # EV e edge nao bloqueiam — o modelo deteta o pico,
-                    # nao calibra P(bracket ganha). O sizing e controlado
-                    # por max_daily_loss, nao por Kelly.
-                    # O EV continua a ser mostrado no dashboard como informacao.
-                    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, max_daily_loss=POLY_MAX_DAILY_LOSS)
+                    # 3. EXECUTAR APOSTA DA FASE
+                    bet_record = build_bet_record(
+                        bracket, p, ev, bankroll, kelly_frac, trading_mode, 
+                        max_daily_loss=POLY_MAX_DAILY_LOSS,
+                        phase_name=phase_name
+                    )
 
                     if trading_mode == TradingMode.PAPER:
                         result = paper_buy(
                             token_id  = bracket.get("token_id", ""),
                             price     = ask_price,
-                            size_usdc = bet_record["bet_size"],
-                            label     = bracket["label"],
+                            size_usdc = BET_SIZE_PER_PHASE,
+                            label     = f"{bracket['label']} [{phase_name}]",
                         )
                         bet_record["order_id"] = result["order_id"]
                         bet_record["status"]   = result["status"]
                         bet        = bet_record
-                        bet_placed = True
+                        phases_done |= phase_to_execute
+                        new_bet_placed = True
 
                     else:
-                        # headless: executar sem confirmacao manual
                         _do_order = headless or confirm_real_order(bet_record)
                         if _do_order:
                             if not executor:
@@ -877,17 +994,19 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 result = executor.buy(
                                     token_id  = bracket.get("token_id", ""),
                                     price     = ask_price,
-                                    size_usdc = bet_record["bet_size"],
-                                    label     = bracket["label"],
+                                    size_usdc = BET_SIZE_PER_PHASE,
+                                    label     = f"{bracket['label']} [{phase_name}]",
                                 )
                                 if result["success"]:
                                     bet_record["order_id"] = result["order_id"]
                                     bet_record["status"]   = result["status"]
                                     bet        = bet_record
-                                    bet_placed = True
+                                    phases_done |= phase_to_execute
+                                    new_bet_placed = True
                                     usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
                                     open_orders  = executor.get_open_orders() if executor else None
-                                    print(f"\n  {C['green']}✓ Ordem enviada — ID: {result['order_id']}{R}")
+                                    print(f"\n  {C['green']}✓ Ordem {phase_label} enviada — "
+                                          f"ID: {result['order_id']}{R}")
                                     tg.alert_order_placed(bet_record)
                                 else:
                                     bet_blocked_reason = f"Ordem falhou: {result['error']}"
@@ -923,7 +1042,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 usdc_balance       = usdc_balance,
                 positions          = clob.positions if clob else None,
                 bet_blocked_reason = bet_blocked_reason,
-                bet_placed         = bet_placed,
+                bet_placed         = new_bet_placed,
                 forecast_max       = forecast_max,
                 berlin_now_dt      = berlin_now(),
                 market_date        = market_date,
@@ -936,7 +1055,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
             log_tick(
                 now, temp_now, p, peak_detected, bracket, ev, bet, log_path,
                 trading_mode       = trading_mode,
-                bet_blocked_reason = bet_blocked_reason if not bet_placed else None,
+                bet_blocked_reason = bet_blocked_reason if not new_bet_placed else None,
             )
 
             # ── Override manual ('f' + Enter) ─────────
@@ -963,7 +1082,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     if forced_bet:
                         bets.append(forced_bet)
                         bets_path.write_text(json.dumps(bets, indent=2, default=str))
-                        bet_placed = True
                         print(f"\n  {C['yellow']}{B}◈  Entrada forcada registada — "
                               f"{forced_bet['bracket']}  ${forced_bet['bet_size']:.2f}{R}\n")
                         time.sleep(2)
@@ -972,12 +1090,10 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         time.sleep(1)
 
             # ── Smart sleep (fast-poll nas janelas EDDM) ──────────────────
-            # Madrugada (23h-8h hora Berlin): intervalo longo, sem polling rapido.
-            # Dia (8h-21h): intervalo normal + fast-poll nas janelas :18/:50.
             _berlin_h = berlin_now().hour
             _last_t   = latest_obs["temp_c"] if latest_obs else None
             if _berlin_h < 8 or _berlin_h >= 21:
-                time.sleep(300)   # 5 min de madrugada — WU nao actualiza de noite
+                time.sleep(300)   # 5 min de madrugada
             else:
                 smart_sleep(interval, wu_key, wu_sess, _last_t)
 
@@ -1049,8 +1165,8 @@ def main():
     parser.add_argument("--kelly",         type=float, default=0.5)
     parser.add_argument("--min-edge",      type=float, default=5.0)
     parser.add_argument("--interval",      type=int,   default=60)
-    parser.add_argument("--max-daily-loss",type=float, default=10.0,
-                        help="Maxima perda aceite por dia em USDC (Risk-First sizing)")
+    parser.add_argument("--max-daily-loss",type=float, default=50.0,
+                        help="Maxima perda aceite por dia em USDC (default: 50)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Modo headless: nao pede confirmacao manual de ordens REAL")
     args = parser.parse_args()
