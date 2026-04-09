@@ -1035,7 +1035,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
             display(
                 now, latest_obs, temps_by_hour, series_today, signals_by_hour, p,
                 market, bracket, ev, bet,
-                len(series_today), bankroll, eff_thr, peak_detected,
+                len(series_today), bankroll, threshold_month, peak_detected,
                 trading_mode       = trading_mode,
                 daily_loss         = clob.daily_loss() if clob else 0.0,
                 max_daily_loss     = POLY_MAX_DAILY_LOSS,
@@ -1050,6 +1050,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 open_orders        = open_orders,
                 signal_window_label= signal_window_label,
                 obs_min_today      = obs_min_today,
+                phases_done        = phases_done,
             )
 
             log_tick(
