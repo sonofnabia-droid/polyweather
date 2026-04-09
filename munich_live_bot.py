@@ -67,6 +67,40 @@ from tg import TG
 
 
 # ══════════════════════════════════════════════════════
+#  SALDO USDC — lê sig_type 0,1,2 e devolve o maior
+# ══════════════════════════════════════════════════════
+def get_real_usdc_balance(private_key: str) -> float | None:
+    """
+    Lê o saldo USDC real do CLOB tentando os 3 sig_types.
+    O saldo util para ordens esta tipicamente em sig_type=2.
+    Devolve o maior saldo encontrado entre os 3 tipos.
+    """
+    try:
+        from py_clob_client.client import ClobClient as _CC
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        _c = _CC(host="https://clob.polymarket.com", key=private_key, chain_id=137)
+        _creds = _c.create_or_derive_api_creds()
+        _c.set_api_creds(_creds)
+        best = 0.0
+        for sig in [0, 1, 2]:
+            try:
+                info = _c.get_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=sig,
+                    )
+                )
+                bal = int(info.get("balance", "0")) / 1e6
+                if bal > best:
+                    best = bal
+            except Exception:
+                pass
+        return best if best > 0 else None
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════
 #  POLYMARKET — fetch market, bracket helpers, EV
 # ══════════════════════════════════════════════════════
 def date_to_slug(d: date) -> str:
@@ -392,7 +426,7 @@ def ask_trading_mode() -> TradingMode:
                     max_daily_loss = POLY_MAX_DAILY_LOSS,
                     log_dir        = LOG_DIR,
                 )
-                usdc_balance_check = _tmp.get_usdc_balance()
+                usdc_balance_check = get_real_usdc_balance(POLY_PRIVATE_KEY)
             except Exception as e:
                 print(f"{C['yellow']}indisponivel ({e}){R}")
 
@@ -449,7 +483,7 @@ def confirm_real_order(bet: dict) -> bool:
 # ══════════════════════════════════════════════════════
 def run(wu_key: str, threshold: float, bankroll: float,
         kelly_frac: float, min_edge: float, interval: int,
-        no_risk: bool = False):
+        no_risk: bool = False, headless: bool = False):
 
     LOG_DIR.mkdir(exist_ok=True)
 
@@ -460,7 +494,13 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "  Obtem em: https://www.wunderground.com/member/api-keys"
         )
 
-    trading_mode = ask_trading_mode()
+    # Em modo headless (VPS), nao perguntar — usar REAL se POLY_PRIVATE_KEY definida
+    if headless:
+        trading_mode = TradingMode.REAL if POLY_PRIVATE_KEY else TradingMode.PAPER
+        mode_str = "REAL" if trading_mode == TradingMode.REAL else "PAPER"
+        print(f"  {DIM}Modo headless: {mode_str} (sem interaccao){R}")
+    else:
+        trading_mode = ask_trading_mode()
     tg = TG()
 
     # ── CLOB client ───────────────────────────────────
@@ -500,7 +540,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
     wu_sess   = make_wu_session()
 
     if trading_mode == TradingMode.REAL and executor:
-        real_balance = executor.get_balance()
+        real_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
         if real_balance is not None and real_balance > 0:
             bankroll = real_balance
         else:
@@ -568,7 +608,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
     if market and clob:
         market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
 
-    usdc_balance = executor.get_balance() if (trading_mode == TradingMode.REAL and executor) else None
+    usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY) if (trading_mode == TradingMode.REAL and POLY_PRIVATE_KEY) else None
     open_orders  = executor.get_open_orders() if (trading_mode == TradingMode.REAL and executor) else None
 
     clob_mode_str   = "real" if trading_mode == TradingMode.REAL else "paper"
@@ -772,8 +812,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
             ev        = compute_ev(p, ask_price) if ask_price else None
 
             if trading_mode == TradingMode.REAL and executor and now.minute % 5 == 0:
-                usdc_balance = executor.get_balance()
-                open_orders  = executor.get_open_orders()
+                usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
+                open_orders  = executor.get_open_orders() if executor else None
 
             bet                = None
             bet_blocked_reason = None
@@ -828,7 +868,9 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         bet_placed = True
 
                     else:
-                        if confirm_real_order(bet_record):
+                        # headless: executar sem confirmacao manual
+                        _do_order = headless or confirm_real_order(bet_record)
+                        if _do_order:
                             if not executor:
                                 bet_blocked_reason = "OrderExecutor nao disponivel"
                             else:
@@ -843,8 +885,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                     bet_record["status"]   = result["status"]
                                     bet        = bet_record
                                     bet_placed = True
-                                    usdc_balance = executor.get_balance()
-                                    open_orders  = executor.get_open_orders()
+                                    usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
+                                    open_orders  = executor.get_open_orders() if executor else None
                                     print(f"\n  {C['green']}✓ Ordem enviada — ID: {result['order_id']}{R}")
                                     tg.alert_order_placed(bet_record)
                                 else:
@@ -1009,6 +1051,8 @@ def main():
     parser.add_argument("--interval",      type=int,   default=60)
     parser.add_argument("--max-daily-loss",type=float, default=10.0,
                         help="Maxima perda aceite por dia em USDC (Risk-First sizing)")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Modo headless: nao pede confirmacao manual de ordens REAL")
     args = parser.parse_args()
 
     run(
@@ -1018,6 +1062,7 @@ def main():
         kelly_frac = args.kelly,
         min_edge   = args.min_edge,
         interval   = args.interval,
+        headless   = args.yes,
     )
 
 
