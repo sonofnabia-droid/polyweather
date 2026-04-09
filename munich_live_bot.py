@@ -960,8 +960,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     peak_detected = peak_detected,
                     bet           = bets[-1] if bets else None,
                     clob_mode     = clob_mode_str,
-                    trading_mode  = trading_mode,
-                    bet_placed    = bet_placed,
                     reason        = "periodic",
                 )
 
