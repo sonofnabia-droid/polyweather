@@ -3,7 +3,7 @@ munich_backtester.py
 ====================
 Backtest V3: Ensemble (LGBM + XGB + Z-Score) + 3 Parcelas com Dupla Confirmação.
 
-P1: Manhã + Forecast Agreement
+P1: 10h<=hora<12h + Forecast Agreement + Mercado confirma + p>=30%
 P2: p_ensemble >= 60% + Mercado confirma (highest ask = running max)
 P3: p_ensemble >= 80%
 """
@@ -20,7 +20,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from zoneinfo import ZoneInfo
-from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import (Progress, BarColumn, TextColumn,
+                           TimeElapsedColumn, TimeRemainingColumn)
 from rich.console import Console
 from rich.table import Table
 from rich import box as rich_box
@@ -52,9 +53,10 @@ MONTHS_PT = [
 
 FEATURE_COLS = [
     "slot_frac", "doy_sin", "doy_cos", "temp_c", "running_max",
-    "temp_vs_climatology", "delta_30m", "delta_1h", "accel", "recent_slope",
-    "temp_lag_3", "roll3_std", "plateau_indicator", "morning_max",
-    "radiation_proxy", "humidity_drop_1h", "prev_7d_avg_max", "seasonal_peak_prior",
+    "temp_vs_climatology", "delta_30m", "delta_1h", "accel",
+    "recent_slope", "temp_lag_3", "roll3_std", "plateau_indicator",
+    "morning_max", "radiation_proxy", "humidity_drop_1h",
+    "prev_7d_avg_max", "seasonal_peak_prior",
 ]
 
 
@@ -73,8 +75,7 @@ def normalize_datetime_ceiling(dt_utc: pd.Timestamp):
     h2, s2 = ceil_slot(h, m)
     if h2 == 24:
         dt_local = (dt_local + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+            hour=0, minute=0, second=0, microsecond=0)
         h2 = 0
     return dt_local, h2, s2
 
@@ -137,16 +138,13 @@ def load_models():
     _console.print(
         f"    [green]✓[/green] {models_str}  AUC=[cyan]{auc}[/cyan]  "
         f"features=[cyan]{len(feat_cols)}[/cyan]  "
-        f"weights=[LGBM {weights['lgbm']:.0%} XGB {weights['xgb']:.0%} Z {weights['zscore']:.0%}]"
-    )
+        f"weights=[LGBM {weights['lgbm']:.0%} "
+        f"XGB {weights['xgb']:.0%} Z {weights['zscore']:.0%}]")
 
     return {
-        "model_lgb": model_lgb,
-        "model_xgb": model_xgb,
-        "feat_cols": feat_cols,
-        "prior_map": prior_map,
-        "monthly_threshold": monthly_threshold,
-        "doy_poly": doy_poly,
+        "model_lgb": model_lgb, "model_xgb": model_xgb,
+        "feat_cols": feat_cols, "prior_map": prior_map,
+        "monthly_threshold": monthly_threshold, "doy_poly": doy_poly,
         "ensemble_weights": weights,
     }
 
@@ -167,7 +165,8 @@ def load_data(csv_path=DATA_CSV) -> pd.DataFrame:
     if "timestamp_utc" not in raw.columns:
         raise ValueError("CSV sem coluna 'timestamp_utc'")
 
-    raw["timestamp_utc"] = pd.to_datetime(raw["timestamp_utc"], errors="coerce")
+    raw["timestamp_utc"] = pd.to_datetime(
+        raw["timestamp_utc"], errors="coerce")
     if raw["timestamp_utc"].dt.tz is not None:
         raw["timestamp_utc"] = raw["timestamp_utc"].dt.tz_convert(None)
     raw["timestamp_utc"] = raw["timestamp_utc"].dt.tz_localize("UTC")
@@ -189,12 +188,14 @@ def load_data(csv_path=DATA_CSV) -> pd.DataFrame:
     raw["temp_c"] = pd.to_numeric(raw["temp_c"], errors="coerce")
 
     if "humidity_pct" in raw.columns:
-        raw["humidity"] = pd.to_numeric(raw["humidity_pct"], errors="coerce")
+        raw["humidity"] = pd.to_numeric(
+            raw["humidity_pct"], errors="coerce")
     else:
         raw["humidity"] = 70.0
 
     if "sky_cover" in raw.columns:
-        raw["cloud_cover"] = pd.to_numeric(raw["sky_cover"], errors="coerce")
+        raw["cloud_cover"] = pd.to_numeric(
+            raw["sky_cover"], errors="coerce")
     else:
         raw["cloud_cover"] = 50.0
 
@@ -241,9 +242,8 @@ class ZScoreStreaming:
 
         arr  = np.array(self.buffer[-self.lookback:])
         n    = len(arr)
-        mean = np.mean(arr)
-        std  = np.std(arr)
-        z    = (temp - mean) / std if std > 0.1 else 0.0
+        mean, std = np.mean(arr), np.std(arr)
+        z = (temp - mean) / std if std > 0.1 else 0.0
         z_signal = float(1.0 / (1.0 + np.exp(-1.5 * (z - self.threshold_z))))
 
         if n >= 4:
@@ -256,8 +256,8 @@ class ZScoreStreaming:
         max_signal = min(1.0, pct_of_max ** 2)
 
         return float(np.clip(
-            0.40 * z_signal + 0.35 * slope_signal + 0.25 * max_signal, 0, 1
-        ))
+            0.40 * z_signal + 0.35 * slope_signal + 0.25 * max_signal,
+            0, 1))
 
     def reset(self):
         self.buffer      = []
@@ -265,12 +265,13 @@ class ZScoreStreaming:
 
 
 # ══════════════════════════════════════════════════════
-#  SIMULATED MARKET
+#  SIMULATED MARKET — ruído dependente da hora
 # ══════════════════════════════════════════════════════
 class SimulatedMarket:
     """
-    Simula o mercado Polymarket com múltiplos brackets de temperatura.
-    O bracket com MAIOR ask é o que o mercado considera mais provável.
+    De manhã (antes das 12h): mercado tem MAIS ruído → highest ask
+    NÃO é sempre o running_max → confirmação falha frequentemente.
+    À tarde (depois das 14h): mercado converge → confirmação funciona.
     """
     def __init__(self, temp_range=range(5, 40)):
         self.temp_range = temp_range
@@ -280,6 +281,13 @@ class SimulatedMarket:
                                 hour: int) -> list[dict]:
         brackets = []
         rmax_int = int(round(running_max))
+
+        if hour < 11:
+            market_noise = 0.20
+        elif hour < 14:
+            market_noise = 0.12
+        else:
+            market_noise = 0.04
 
         for temp in self.temp_range:
             dist = abs(temp - rmax_int)
@@ -298,16 +306,18 @@ class SimulatedMarket:
                 base_ask = min(0.97, base_ask + 0.10)
 
             ask = float(np.clip(
-                base_ask + np.random.uniform(-0.03, 0.03), 0.02, 0.97
-            ))
+                base_ask + np.random.uniform(-market_noise, market_noise),
+                0.02, 0.97))
 
-            is_last = (temp == self.temp_range[-1])
+            is_last  = (temp == self.temp_range[-1])
             is_first = (temp == self.temp_range[0])
 
             if is_last:
-                label, lo, hi = f"{temp}°C or higher", float(temp), 99.0
+                label, lo, hi = (f"{temp}°C or higher",
+                                 float(temp), 99.0)
             elif is_first:
-                label, lo, hi = f"{temp}°C or lower", -99.0, float(temp)
+                label, lo, hi = (f"{temp}°C or lower",
+                                 -99.0, float(temp))
             else:
                 label, lo, hi = f"{temp}°C", float(temp), float(temp)
 
@@ -346,23 +356,20 @@ def build_slot(slots_so_far, current, month, doy, prior_map):
     prior = prior_map.get((month, hour, slot30), 0.5)
     slot_frac = (hour + slot30 / 60) / 24
 
-    # recent_slope
     slope_w = vals[-4:] if n >= 4 else vals
     if len(slope_w) >= 2:
         _x = np.arange(len(slope_w), dtype=float) - (len(slope_w) - 1) / 2
         _denom = float((_x * _x).sum())
-        slope = float((_x * np.array(slope_w)).sum() / _denom) if _denom > 0 else 0.0
+        slope = (float((_x * np.array(slope_w)).sum() / _denom)
+                 if _denom > 0 else 0.0)
     else:
         slope = 0.0
 
-    # plateau_indicator
     plat_w  = vals[-6:] if n >= 6 else vals
     plateau = 1.0 if (np.std(plat_w) < 0.4 and n >= 4) else 0.0
 
-    # radiation_proxy
     radiation = float(np.cos((slot_frac - 0.5) * 2 * np.pi)) * (1 - cloud / 100)
 
-    # humidity_drop_1h
     hum_drop = lagh(3) - hums[-1] if n >= 3 else 0.0
 
     prev7 = current["prev_7d_avg_max"]
@@ -390,35 +397,31 @@ def build_slot(slots_so_far, current, month, doy, prior_map):
 
 
 # ══════════════════════════════════════════════════════
-#  PREDICT ENSEMBLE
+#  PREDICT ENSEMBLE — usa predict_proba() !!!
 # ══════════════════════════════════════════════════════
-def predict_ensemble(models, feat_cols, slots_so_far, current,
+def predict_ensemble(models, slots_so_far, current,
                      month, doy, zscore_det):
     hour = current["hour"]
     if len(slots_so_far) < 4 or hour < MIN_HOUR:
         return 0.0, 0.0, None, None
 
+    feat_cols = models["feat_cols"]
     feat  = build_slot(slots_so_far, current, month, doy, models["prior_map"])
     avail = [f for f in feat_cols if f in feat]
     X     = pd.DataFrame([feat])[avail].fillna(0)
 
-    # LightGBM
-    p_lgbm = float(models["model_lgb"].predict(X)[0])
+    # predict_proba() NÃO predict() !!!
+    p_lgbm = float(models["model_lgb"].predict_proba(X)[0, 1])
 
-    # XGBoost
     p_xgb = None
     if models["model_xgb"] is not None:
         try:
-            p_xgb = float(models["model_xgb"].predict(X)[0])
+            p_xgb = float(models["model_xgb"].predict_proba(X)[0, 1])
         except Exception:
             pass
 
-    # Z-Score
-    p_zscore = None
-    if zscore_det is not None:
-        p_zscore = zscore_det.update(current["temp_c"])
+    p_zscore = zscore_det.update(current["temp_c"]) if zscore_det else None
 
-    # Ensemble
     w = models["ensemble_weights"]
     p = w["lgbm"] * p_lgbm
     if p_xgb is not None:
@@ -463,9 +466,10 @@ def run(df, models, sim_market, parcel_size=5.0):
 
         for d, day_df in df.groupby("date"):
             progress.update(task, advance=1)
-            day_df = day_df.sort_values(["hour", "slot30"]).reset_index(drop=True)
-            month  = int(day_df["month"].iloc[0])
-            doy    = int(day_df["doy"].iloc[0])
+            day_df = day_df.sort_values(
+                ["hour", "slot30"]).reset_index(drop=True)
+            month   = int(day_df["month"].iloc[0])
+            doy     = int(day_df["doy"].iloc[0])
             cloud_m = float(day_df["cloud_cover"].mean())
 
             peak_idx  = day_df["temp_c"].idxmax()
@@ -479,7 +483,6 @@ def run(df, models, sim_market, parcel_size=5.0):
 
             phased = PhasedEntry(parcel_size=parcel_size)
 
-            # Simular forecast agreement (80% das vezes concorda)
             forecast_agrees = np.random.random() < 0.80
 
             for _, row in day_df.iterrows():
@@ -498,7 +501,8 @@ def run(df, models, sim_market, parcel_size=5.0):
                 if h < MIN_HOUR or len(slots_so_far) < 4:
                     slots_out.append({
                         "date": d, "hour": h, "slot30": s,
-                        "temp": t, "p_ens": 0.0, "peak_true_h": peak_slot[0],
+                        "temp": t, "p_ens": 0.0,
+                        "peak_true_h": peak_slot[0],
                     })
                     continue
 
@@ -509,9 +513,9 @@ def run(df, models, sim_market, parcel_size=5.0):
                     "temp_c": t,
                 }
 
-                # Ensemble prediction
+                # predict_ensemble(models, slots, current, month, doy, zscore)
                 p_ens, p_lgbm, p_xgb, p_zs = predict_ensemble(
-                    models, feat_cols, slots_so_far, current_extra,
+                    models, slots_so_far, current_extra,
                     month, doy, zscore
                 )
 
@@ -525,34 +529,27 @@ def run(df, models, sim_market, parcel_size=5.0):
 
                 # ── Simular mercado ────────────────────
                 brackets   = sim_market.get_simulated_brackets(
-                    p_ens, running_max, h
-                )
+                    p_ens, running_max, h)
                 market_sim = {"brackets": brackets}
 
-                # Forecast agreement simulado
                 fc_agreement = {"valid": forecast_agrees}
 
                 # ── Avaliar parcelas ──────────────────
                 actions = phased.evaluate(
-                    p_ens, h, market_sim, running_max, fc_agreement
-                )
+                    p_ens, h, market_sim, running_max, fc_agreement)
 
                 for act in actions:
                     if act["size_usdc"] > 0:
                         pidx = act["parcel_idx"]
 
-                        # Escolher bracket
                         if pidx == 1:
-                            # P2: bracket com MAIOR ask (confirmação do mercado)
                             best = max(brackets, key=lambda b: b["ask"])
                         else:
-                            # P1, P3: bracket do running max
                             rmax_int = int(round(running_max))
                             best = next(
                                 (b for b in brackets
                                  if b["temp_lo"] <= rmax_int <= b["temp_hi"]),
-                                max(brackets, key=lambda b: b["ask"])
-                            )
+                                max(brackets, key=lambda b: b["ask"]))
 
                         phased.mark_bought(pidx, {
                             "hour": h, "slot30": s,
@@ -567,14 +564,14 @@ def run(df, models, sim_market, parcel_size=5.0):
 
             peak_idx_val = slot_idx(peak_slot[0], peak_slot[1])
 
-            # Calcular lag de cada parcela (CORRIGIDO)
             parcel_lags = []
             for i in range(3):
-                if phased.parcel_bought[i] and phased.parcel_records[i] is not None:
+                if (phased.parcel_bought[i]
+                        and phased.parcel_records[i] is not None):
                     lag = (slot_idx(
                                phased.parcel_records[i]["hour"],
-                               phased.parcel_records[i]["slot30"]
-                           ) - peak_idx_val)
+                               phased.parcel_records[i]["slot30"])
+                           - peak_idx_val)
                     parcel_lags.append(lag)
                 else:
                     parcel_lags.append(None)
@@ -584,40 +581,47 @@ def run(df, models, sim_market, parcel_size=5.0):
             first_slot = next(
                 (phased.parcel_records[i]
                  for i in range(3)
-                 if phased.parcel_bought[i] and phased.parcel_records[i] is not None),
-                None
-            )
+                 if phased.parcel_bought[i]
+                 and phased.parcel_records[i] is not None),
+                None)
+
             lag_first = None
             if first_slot is not None:
-                lag_first = slot_idx(first_slot["hour"], first_slot["slot30"]) - peak_idx_val
+                lag_first = (slot_idx(first_slot["hour"],
+                                      first_slot["slot30"])
+                             - peak_idx_val)
 
-            correct_lags   = [l for l in parcel_lags if l is not None and l >= 0]
-            premature_lags = [l for l in parcel_lags if l is not None and l < 0]
+            correct_lags   = [l for l in parcel_lags
+                              if l is not None and l >= 0]
+            premature_lags = [l for l in parcel_lags
+                              if l is not None and l < 0]
             season = next(
-                (s for s, ms in SEASONS.items() if month in ms), "spring"
-            )
+                (s for s, ms in SEASONS.items() if month in ms),
+                "spring")
 
             results.append({
-                "date": d,
-                "month": month,
-                "doy": doy,
-                "season": season,
-                "cloud_mean": round(cloud_m, 1),
-                "peak_temp": round(peak_temp, 2),
-                "peak_h_true": peak_slot[0],
-                "detected": detected,
-                "n_parcels": sum(phased.parcel_bought),
-                "parcel1_bought": phased.parcel_bought[0],
-                "parcel2_bought": phased.parcel_bought[1],
-                "parcel3_bought": phased.parcel_bought[2],
-                "parcel1_lag": parcel_lags[0],
-                "parcel2_lag": parcel_lags[1],
-                "parcel3_lag": parcel_lags[2],
-                "lag_first_h": round(lag_first * 0.5, 1) if lag_first is not None else None,
-                "correct": len(correct_lags) > 0 and len(premature_lags) == 0,
-                "premature": len(premature_lags) > 0,
-                "missed": not detected,
-                "total_invested": phased.total_invested,
+                "date":            d,
+                "month":           month,
+                "doy":             doy,
+                "season":          season,
+                "cloud_mean":      round(cloud_m, 1),
+                "peak_temp":       round(peak_temp, 2),
+                "peak_h_true":     peak_slot[0],
+                "detected":        detected,
+                "n_parcels":       sum(phased.parcel_bought),
+                "parcel1_bought":  phased.parcel_bought[0],
+                "parcel2_bought":  phased.parcel_bought[1],
+                "parcel3_bought":  phased.parcel_bought[2],
+                "parcel1_lag":     parcel_lags[0],
+                "parcel2_lag":     parcel_lags[1],
+                "parcel3_lag":     parcel_lags[2],
+                "lag_first_h":     (round(lag_first * 0.5, 1)
+                                    if lag_first is not None else None),
+                "correct":         (len(correct_lags) > 0
+                                    and len(premature_lags) == 0),
+                "premature":       len(premature_lags) > 0,
+                "missed":          not detected,
+                "total_invested":  phased.total_invested,
             })
 
     return pd.DataFrame(results), pd.DataFrame(slots_out)
@@ -632,31 +636,40 @@ def compute_metrics(results):
     prem = results["premature"].sum()
     miss = results["missed"].sum()
 
-    lags_h = results[results["lag_first_h"].notna()]["lag_first_h"].values
+    correct_lags_h = (results[results["correct"]
+                      & results["lag_first_h"].notna()]
+                      ["lag_first_h"].values)
 
     m = {
-        "n_days":         n,
-        "correct_pct":    round(corr / n * 100, 1),
-        "premature_pct":  round(prem / n * 100, 1),
-        "missed_pct":     round(miss / n * 100, 1),
-        "lag_mean_h":     round(float(np.mean(lags_h)), 2) if len(lags_h) else None,
-        "lag_median_h":   round(float(np.median(lags_h)), 2) if len(lags_h) else None,
-        "lag_le1h_pct":   round((lags_h <= 1.0).mean() * 100, 1) if len(lags_h) else 0,
-        "lag_le2h_pct":   round((lags_h <= 2.0).mean() * 100, 1) if len(lags_h) else 0,
-        "parcel1_pct":    round(results["parcel1_bought"].mean() * 100, 1),
-        "parcel2_pct":    round(results["parcel2_bought"].mean() * 100, 1),
-        "parcel3_pct":    round(results["parcel3_bought"].mean() * 100, 1),
-        "avg_n_parcels":  round(results["n_parcels"].mean(), 2),
-        "avg_invested":   round(results["total_invested"].mean(), 2),
+        "n_days":       n,
+        "correct_pct":  round(corr / n * 100, 1),
+        "premature_pct": round(prem / n * 100, 1),
+        "missed_pct":   round(miss / n * 100, 1),
+        "lag_mean_h":   (round(float(np.mean(correct_lags_h)), 2)
+                         if len(correct_lags_h) else None),
+        "lag_median_h": (round(float(np.median(correct_lags_h)), 2)
+                         if len(correct_lags_h) else None),
+        "lag_le1h_pct": (round((correct_lags_h <= 1.0).mean() * 100, 1)
+                         if len(correct_lags_h) else 0),
+        "lag_le2h_pct": (round((correct_lags_h <= 2.0).mean() * 100, 1)
+                         if len(correct_lags_h) else 0),
+        "parcel1_pct":  round(results["parcel1_bought"].mean() * 100, 1),
+        "parcel2_pct":  round(results["parcel2_bought"].mean() * 100, 1),
+        "parcel3_pct":  round(results["parcel3_bought"].mean() * 100, 1),
+        "avg_n_parcels": round(results["n_parcels"].mean(), 2),
+        "avg_invested": round(results["total_invested"].mean(), 2),
     }
 
-    # Por estação
     for season in SEASONS:
         sub = results[results["season"] == season]
         if not sub.empty:
-            m[f"{season}_correct_pct"] = round(sub["correct"].mean() * 100, 1)
-            sl = sub[sub["lag_first_h"].notna()]["lag_first_h"].values
-            m[f"{season}_lag_mean_h"] = round(float(np.mean(sl)), 2) if len(sl) else None
+            m[f"{season}_correct_pct"] = round(
+                sub["correct"].mean() * 100, 1)
+            sl = (sub[sub["correct"]
+                      & sub["lag_first_h"].notna()]
+                  ["lag_first_h"].values)
+            m[f"{season}_lag_mean_h"] = (
+                round(float(np.mean(sl)), 2) if len(sl) else None)
 
     return m
 
@@ -669,9 +682,11 @@ def plot(results, slots_df, metrics, start_year):
 
     BG, PANEL = "#07090D", "#0D1018"
     C = {
-        "correct": "#25BE62", "premature": "#F0A500", "missed": "#D93838",
-        "blue": "#4D9EFF", "muted": "#424C64", "text": "#D8DCE8",
-        "grid": "#111520", "border": "#181E2C", "purple": "#A855F7",
+        "correct": "#25BE62", "premature": "#F0A500",
+        "missed": "#D93838", "blue": "#4D9EFF",
+        "muted": "#424C64", "text": "#D8DCE8",
+        "grid": "#111520", "border": "#181E2C",
+        "purple": "#A855F7",
     }
 
     plt.rcParams.update({
@@ -696,6 +711,7 @@ def plot(results, slots_df, metrics, start_year):
     prem_m = results.groupby("month")["premature"].mean() * 100
     miss_m = results.groupby("month")["missed"].mean() * 100
     x = np.arange(len(months_range))
+
     ax1.bar(x, corr_m.reindex(months_range, fill_value=0), 0.6,
             color=C["correct"], alpha=0.88, label="Correcto")
     ax1.bar(x, prem_m.reindex(months_range, fill_value=0), 0.6,
@@ -704,12 +720,13 @@ def plot(results, slots_df, metrics, start_year):
     bot2 = (corr_m.reindex(months_range, fill_value=0)
             + prem_m.reindex(months_range, fill_value=0))
     ax1.bar(x, miss_m.reindex(months_range, fill_value=0), 0.6,
-            color=C["missed"], alpha=0.88, label="Não detectado", bottom=bot2)
+            color=C["missed"], alpha=0.88, label="Não detectado",
+            bottom=bot2)
     ax1.set_xticks(x)
     ax1.set_xticklabels(m_lbls, fontsize=8)
     ax1.set_ylabel("% dias")
     ax1.set_ylim(0, 110)
-    ax1.axhline(80, color=C["muted"], linewidth=0.8, linestyle="--", alpha=0.5)
+    ax1.axhline(80, color=C["muted"], lw=0.8, ls="--", alpha=0.5)
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3, axis="y")
 
@@ -727,7 +744,8 @@ def plot(results, slots_df, metrics, start_year):
     bot3 = (p1.reindex(months_range, fill_value=0)
             + p2.reindex(months_range, fill_value=0))
     ax2.bar(x, p3.reindex(months_range, fill_value=0), 0.6,
-            color=C["correct"], alpha=0.8, label="P3 Confirmado", bottom=bot3)
+            color=C["correct"], alpha=0.8, label="P3 Confirmado",
+            bottom=bot3)
     ax2.set_xticks(x)
     ax2.set_xticklabels(m_lbls, fontsize=7)
     ax2.set_ylabel("% dias")
@@ -736,29 +754,33 @@ def plot(results, slots_df, metrics, start_year):
 
     # 3. Distribuição do lag
     ax3 = fig.add_subplot(gs[1, 0])
-    ax3.set_title("Distribuição do Lag (1ª parcela)")
-    lags = results[results["detected"]]["lag_first_h"].dropna().values
-    if len(lags):
-        bins = np.arange(lags.min() - 0.5, lags.max() + 1.0, 0.5)
-        cnts, edges = np.histogram(lags, bins=bins)
+    ax3.set_title("Distribuição do Lag (1ª parcela, correctos)")
+    correct_lags = results[results["correct"]]["lag_first_h"].dropna().values
+    if len(correct_lags):
+        vmin, vmax = correct_lags.min(), correct_lags.max()
+        bins = np.arange(vmin - 0.5, vmax + 1.0, 0.5)
+        cnts, edges = np.histogram(correct_lags, bins=bins)
         for b, cnt in zip(edges[:-1], cnts):
             ax3.bar(b, cnt, width=0.45,
-                    color=C["correct"] if b >= 0 else C["premature"], alpha=0.85)
-        ax3.axvline(0, color=C["text"], linewidth=1.2, linestyle="--")
-        ax3.axvline(float(np.mean(lags)), color=C["blue"], linewidth=1.5,
-                    linestyle="--", label=f"Média: {np.mean(lags):.1f}h")
+                    color=C["correct"] if b >= 0 else C["premature"],
+                    alpha=0.85)
+        ax3.axvline(0, color=C["text"], lw=1.2, ls="--")
+        ax3.axvline(float(np.mean(correct_lags)), color=C["blue"],
+                    lw=1.5, ls="--",
+                    label=f"Média: {np.mean(correct_lags):.1f}h")
         ax3.legend(fontsize=8)
         ax3.grid(True, alpha=0.3, axis="y")
 
     # 4. Lag por parcela
     ax4 = fig.add_subplot(gs[1, 1])
-    ax4.set_title("Lag Médio por Parcela")
+    ax4.set_title("Lag Médio por Parcela (correctos)")
     parcel_lag_means = []
     parcel_lag_stds  = []
     parcel_labels    = []
-    for pidx, pname in [(0, "P1 Manhã"), (1, "P2 Pico~"), (2, "P3 Confirmado")]:
+    for pidx, pname in [(0, "P1 Manhã"), (1, "P2 Pico~"),
+                        (2, "P3 Confirmado")]:
         col = f"parcel{pidx + 1}_lag"
-        vals = results[col].dropna().values * 0.5
+        vals = results[results["correct"]][col].dropna().values * 0.5
         if len(vals):
             parcel_lag_means.append(np.mean(vals))
             parcel_lag_stds.append(np.std(vals))
@@ -772,7 +794,7 @@ def plot(results, slots_df, metrics, start_year):
     ax4.bar(parcel_labels, parcel_lag_means, yerr=parcel_lag_stds,
             color=colors_p, alpha=0.85,
             error_kw={"color": C["muted"], "capsize": 3})
-    ax4.axhline(0, color=C["muted"], linewidth=0.8)
+    ax4.axhline(0, color=C["muted"], lw=0.8)
     ax4.set_ylabel("Lag (h)")
     ax4.grid(True, alpha=0.3, axis="y")
 
@@ -791,29 +813,35 @@ def plot(results, slots_df, metrics, start_year):
 
     # 6. Heatmap p_ensemble
     ax6 = fig.add_subplot(gs[2, :])
-    ax6.set_title("P(ensemble) — 60 dias amostra  [^ pico real  1/2/3 = parcelas]")
-    sample = results.sample(min(60, len(results)), random_state=42).sort_values("date")
-    slot_keys = [(h, s) for h in range(DAY_START, DAY_END + 1) for s in [0, 30]]
+    ax6.set_title("P(ensemble) — 60 dias amostra")
+    sample = results.sample(
+        min(60, len(results)), random_state=42).sort_values("date")
+    slot_keys = [(h, s)
+                 for h in range(DAY_START, DAY_END + 1)
+                 for s in [0, 30]]
 
     pivot = []
     for _, row in sample.iterrows():
         dslots = slots_df[slots_df["date"] == row["date"]].copy()
         dslots["sk"] = list(zip(dslots["hour"], dslots["slot30"]))
         sk_to_p = dict(zip(dslots["sk"], dslots["p_ens"]))
-        pivot.append([float(sk_to_p.get((h, s), 0)) for h, s in slot_keys])
+        pivot.append([float(sk_to_p.get((h, s), 0))
+                      for h, s in slot_keys])
 
     if pivot:
         mat = np.array(pivot)
-        im  = ax6.imshow(mat, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1,
-                         interpolation="nearest",
+        im  = ax6.imshow(mat, aspect="auto", cmap="RdYlGn",
+                         vmin=0, vmax=1, interpolation="nearest",
                          extent=[0, len(slot_keys), len(sample), 0])
-        plt.colorbar(im, ax=ax6, fraction=0.015, pad=0.01, label="P(ensemble)")
-        hour_tick_pos = [i for i, (h, s) in enumerate(slot_keys) if s == 0]
-        hour_tick_lbl = [f"{h}h" for h, s in slot_keys if s == 0]
-        ax6.set_xticks(hour_tick_pos)
-        ax6.set_xticklabels(hour_tick_lbl, fontsize=7)
+        plt.colorbar(im, ax=ax6, fraction=0.015, pad=0.01,
+                     label="P(ensemble)")
+        htp = [i for i, (h, s) in enumerate(slot_keys) if s == 0]
+        htl = [f"{h}h" for h, s in slot_keys if s == 0]
+        ax6.set_xticks(htp)
+        ax6.set_xticklabels(htl, fontsize=7)
         ax6.set_yticks(range(len(sample)))
-        ax6.set_yticklabels([str(d) for d in sample["date"].values], fontsize=6)
+        ax6.set_yticklabels(
+            [str(d) for d in sample["date"].values], fontsize=6)
 
     # 7. Investimento médio por mês
     ax7 = fig.add_subplot(gs[3, 0])
@@ -835,13 +863,14 @@ def plot(results, slots_df, metrics, start_year):
             season_data.append((season, metrics[key]))
     if season_data:
         s_names, s_vals = zip(*season_data)
-        s_cols = [C["blue"] if v >= 70 else C["premature"] for v in s_vals]
+        s_cols = [C["blue"] if v >= 70 else C["premature"]
+                  for v in s_vals]
         ax8.bar(s_names, s_vals, color=s_cols, alpha=0.85)
-        ax8.axhline(80, color=C["muted"], linewidth=0.8, linestyle="--", alpha=0.5)
+        ax8.axhline(80, color=C["muted"], lw=0.8, ls="--", alpha=0.5)
         ax8.set_ylabel("% correcto")
         ax8.grid(True, alpha=0.3, axis="y")
 
-    # 9. Resumo texto
+    # 9. Resumo
     ax9 = fig.add_subplot(gs[3, 2])
     ax9.axis("off")
     summary_lines = [
@@ -850,28 +879,31 @@ def plot(results, slots_df, metrics, start_year):
         f"Prematuro: {metrics['premature_pct']}%",
         f"Não detectado: {metrics['missed_pct']}%",
         "",
-        f"Lag médio: +{metrics.get('lag_mean_h', '?')}h",
+        f"Lag médio (correctos): "
+        f"+{metrics.get('lag_mean_h', '?')}h",
         f"Lag ≤ 1h: {metrics.get('lag_le1h_pct', 0)}%",
         f"Lag ≤ 2h: {metrics.get('lag_le2h_pct', 0)}%",
         "",
-        f"Parcela 1 (manhã): {metrics['parcel1_pct']}% dias",
-        f"Parcela 2 (pico~): {metrics['parcel2_pct']}% dias",
-        f"Parcela 3 (confirm): {metrics['parcel3_pct']}% dias",
+        f"P1 Manhã: {metrics['parcel1_pct']}% dias",
+        f"P2 Pico~: {metrics['parcel2_pct']}% dias",
+        f"P3 Confirmado: {metrics['parcel3_pct']}% dias",
         f"Média parcelas/dia: {metrics['avg_n_parcels']}",
-        f"Investimento médio: ${metrics['avg_invested']:.2f}/dia",
+        f"Invest. médio: ${metrics['avg_invested']:.2f}/dia",
     ]
-    ax9.text(0.1, 0.95, "\n".join(summary_lines), transform=ax9.transAxes,
-             fontsize=9, verticalalignment="top", fontfamily="monospace",
+    ax9.text(0.1, 0.95, "\n".join(summary_lines),
+             transform=ax9.transAxes, fontsize=9,
+             verticalalignment="top", fontfamily="monospace",
              color=C["text"],
-             bbox=dict(boxstyle="round", facecolor=PANEL, edgecolor=C["border"]))
+             bbox=dict(boxstyle="round", facecolor=PANEL,
+                       edgecolor=C["border"]))
 
-    lag_str = f"+{metrics['lag_mean_h']}h" if metrics.get('lag_mean_h') else "N/A"
+    lag_str = (f"+{metrics['lag_mean_h']}h"
+               if metrics.get('lag_mean_h') else "N/A")
     fig.suptitle(
         f"Munich Max Temp — Backtest Ensemble 3 Parcelas  "
         f"correcto={metrics['correct_pct']}%  lag={lag_str}  "
         f"invest=${metrics['avg_invested']:.1f}/dia",
-        fontsize=13,
-    )
+        fontsize=13)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     out_path = OUTPUT_DIR / f"munich_backtest_ensemble_{start_year}.png"
@@ -889,7 +921,7 @@ def main():
     start_date = pd.to_datetime(start_str).date()
     end_date   = date.today() - timedelta(days=1)
 
-    print(f"\n  Backtest V3 Ensemble 3 Parcelas: {start_date} → {end_date}")
+    print(f"\n  Backtest V3: {start_date} → {end_date}")
 
     print("\n[1/5] Modelos...")
     models = load_models()
@@ -898,7 +930,8 @@ def main():
     df_all = load_data()
     df_all["date"] = pd.to_datetime(df_all["date"]).dt.date
     df = df_all[
-        (df_all["date"] >= start_date) & (df_all["date"] <= end_date)
+        (df_all["date"] >= start_date)
+        & (df_all["date"] <= end_date)
     ].copy()
     print(f"  {len(df):,} slots no intervalo")
 
@@ -918,16 +951,26 @@ def main():
     t.add_column("Value", style="bold white")
 
     t.add_row("Dias analisados", f"{metrics['n_days']}")
-    t.add_row("Correcto",        f"[green]{metrics['correct_pct']}%[/green]")
-    t.add_row("Prematuro",       f"[yellow]{metrics['premature_pct']}%[/yellow]")
-    t.add_row("Não detectado",   f"[red]{metrics['missed_pct']}%[/red]")
-    t.add_row("Lag médio",       f"+{metrics.get('lag_mean_h', '?')}h")
-    t.add_row("Lag ≤ 1h",        f"{metrics.get('lag_le1h_pct', 0)}%")
-    t.add_row("Lag ≤ 2h",        f"{metrics.get('lag_le2h_pct', 0)}%")
-    t.add_row("P1 Manhã",        f"{metrics['parcel1_pct']}% dias")
-    t.add_row("P2 Modelo+Mercado", f"{metrics['parcel2_pct']}% dias")
-    t.add_row("P3 Alta confiança", f"{metrics['parcel3_pct']}% dias")
-    t.add_row("Invest. médio/dia", f"${metrics['avg_invested']:.2f}")
+    t.add_row("Correcto",
+              f"[green]{metrics['correct_pct']}%[/green]")
+    t.add_row("Prematuro",
+              f"[yellow]{metrics['premature_pct']}%[/yellow]")
+    t.add_row("Não detectado",
+              f"[red]{metrics['missed_pct']}%[/red]")
+    t.add_row("Lag médio (correctos)",
+              f"+{metrics.get('lag_mean_h', '?')}h")
+    t.add_row("Lag ≤ 1h",
+              f"{metrics.get('lag_le1h_pct', 0)}%")
+    t.add_row("Lag ≤ 2h",
+              f"{metrics.get('lag_le2h_pct', 0)}%")
+    t.add_row("P1 Manhã (10h–12h)",
+              f"{metrics['parcel1_pct']}% dias")
+    t.add_row("P2 Modelo+Mercado",
+              f"{metrics['parcel2_pct']}% dias")
+    t.add_row("P3 Alta confiança",
+              f"{metrics['parcel3_pct']}% dias")
+    t.add_row("Invest. médio/dia",
+              f"${metrics['avg_invested']:.2f}")
     _console.print(t)
 
     # Por estação
@@ -937,19 +980,24 @@ def main():
     t_s.add_column("Correcto", justify="right", width=10)
     t_s.add_column("Lag médio", justify="right", width=10)
 
-    season_icons = {"winter": "❄️ ", "spring": "🌱", "summer": "☀️ ", "autumn": "🍂"}
+    season_icons = {
+        "winter": "❄️ ", "spring": "🌱",
+        "summer": "☀️ ", "autumn": "🍂",
+    }
     for season in ["winter", "spring", "summer", "autumn"]:
         key_c = f"{season}_correct_pct"
         key_l = f"{season}_lag_mean_h"
         if key_c in metrics:
             c_pct = metrics[key_c]
-            col   = "green" if c_pct >= 70 else ("yellow" if c_pct >= 50 else "red")
-            lag_v = f"+{metrics[key_l]:.2f}h" if key_l in metrics and metrics[key_l] is not None else "—"
+            col = ("green" if c_pct >= 70
+                   else "yellow" if c_pct >= 50 else "red")
+            lag_v = (f"+{metrics[key_l]:.2f}h"
+                     if key_l in metrics
+                     and metrics[key_l] is not None else "—")
             t_s.add_row(
                 f"{season_icons.get(season, '')}{season}",
                 f"[{col}]{c_pct:.1f}%[/{col}]",
-                lag_v,
-            )
+                lag_v)
     _console.print(t_s)
 
     print("\n[5/5] Dashboard...")
