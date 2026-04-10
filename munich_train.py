@@ -455,8 +455,39 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
         joblib.dump(xgb, OUTPUT_DIR / "xgb_peak.pkl")
         print(f"  ✓ {OUTPUT_DIR / 'xgb_peak.pkl'}")
 
+    # ── Feature Importances ──────────────────────────────
+    feat_cols = wf_results.get("feature_cols", FEATURE_COLS)
+    
+    lgb_imp = lgb.feature_importances_
+    lgb_imp_pct = lgb_imp / lgb_imp.sum()
+    
+    if xgb is not None:
+        xgb_imp = xgb.feature_importances_
+        xgb_imp_pct = xgb_imp / xgb_imp.sum()
+        # Ensemble importance: 50% LGBM + 30% XGB
+        ens_imp = 0.5 * lgb_imp_pct + 0.3 * xgb_imp_pct
+        ens_imp_pct = ens_imp / ens_imp.sum()
+    else:
+        xgb_imp_pct = None
+        ens_imp_pct = lgb_imp_pct
+
+    # Ordenar por importância
+    sorted_idx = np.argsort(ens_imp_pct)[::-1]
+    
+    lgb_importance_dict = {}
+    xgb_importance_dict = {}
+    ensemble_importance_dict = {}
+    
+    for i in sorted_idx:
+        fname = feat_cols[i]
+        lgb_importance_dict[fname] = round(float(lgb_imp_pct[i]) * 100, 2)
+        if xgb_imp_pct is not None:
+            xgb_importance_dict[fname] = round(float(xgb_imp_pct[i]) * 100, 2)
+        ensemble_importance_dict[fname] = round(float(ens_imp_pct[i]) * 100, 2)
+
+    # ── Config JSON ────────────────────────────────────
     config = {
-        "feature_cols":     FEATURE_COLS,
+        "feature_cols":     feat_cols,
         "resolution":       "30min_ceiling",
         "global_auc":       round(wf_results["global_auc_lgb"], 4),
         "global_auc_xgb":   round(wf_results["global_auc_xgb"], 4) if wf_results.get("global_auc_xgb") else None,
@@ -466,6 +497,9 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
         "ensemble_weights": {
             "lgbm": 0.50, "xgb": 0.30 if train_xgb else 0.0, "zscore": 0.20,
         },
+        "lgbm_feature_importance_pct":  lgb_importance_dict,
+        "xgb_feature_importance_pct":   xgb_importance_dict,
+        "ensemble_feature_importance_pct": ensemble_importance_dict,
     }
 
     prior_str = {}
@@ -478,6 +512,12 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
     )
     print(f"  ✓ {OUTPUT_DIR / 'peak_model_config.json'}")
 
+    # ── Mostrar Top 10 ─────────────────────────────────
+    print(f"\n  Top 10 Features (Ensemble Importance):")
+    for rank, i in enumerate(sorted_idx[:10], 1):
+        pct = ens_imp_pct[i] * 100
+        bar = '█' * int(pct / 2)
+        print(f"    {rank:>2}. {feat_cols[i]:<24} {pct:>5.1f}%  {DIM}{bar}{R}")
 
 # ══════════════════════════════════════════════════════
 #  MAIN
