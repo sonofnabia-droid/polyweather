@@ -5,8 +5,8 @@ Treino do modelo de pico max temp Munich — V3 Ensemble.
 
 Pipeline:
   1. Carregar historic/munich.csv (desde 2010)
-  2. Construir features 30min CEILING (18 features V1)
-  3. Walk-Forward Validation (expanding window)
+  2. Construir features 30min CEILING (18 features V1 canónicas)
+  3. Walk-Forward Validation (expanding window por ano)
   4. Treinar LightGBM + XGBoost em paralelo
   5. Calcular threshold adaptativo (curva DOY contínua)
   6. Calcular seasonal_peak_prior
@@ -14,9 +14,11 @@ Pipeline:
 
 Uso:
     python munich_train.py
-    python munich_train.py --walk-forward --xgb
+    python munich_train.py --no-xgb
+    python munich_train.py --doy-degree 7
 """
 
+import argparse
 import json
 import warnings
 from datetime import date, timedelta
@@ -26,11 +28,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
-from scipy.signal import find_peaks
 
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score
 
 warnings.filterwarnings("ignore")
 
@@ -45,6 +46,7 @@ DAY_START = 6
 DAY_END   = 21
 MIN_HOUR  = 6
 
+# 18 FEATURES V1 CANÓNICAS — NÃO ALTERAR sem re-treino
 FEATURE_COLS = [
     "slot_frac",
     "doy_sin", "doy_cos",
@@ -69,8 +71,7 @@ FEATURE_COLS = [
 def ceil_slot(hour: int, minute: int) -> tuple[int, int]:
     if minute < 30:
         return hour, 30
-    else:
-        return hour + 1, 0
+    return hour + 1, 0
 
 
 def normalize_datetime_ceiling(dt_utc: pd.Timestamp):
@@ -147,17 +148,16 @@ def load_csv(csv_path: Path = DATA_CSV) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════
 #  BUILD DATASET
 # ══════════════════════════════════════════════════════
-def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
+def build_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Constrói o dataset de treino slot a slot.
-    Para cada slot, calcula as 18 features V1 e o label (peak_already_passed).
+    Constrói o dataset de treino slot a slot com as 18 features V1.
     """
     print("  A construir dataset slot a slot...")
 
     # Daily max e prev7
-    daily_max = df.groupby("date")["temp_c"].max().sort_index()
+    daily_max  = df.groupby("date")["temp_c"].max().sort_index()
     dates_list = list(daily_max.index)
-    prev7_map = {}
+    prev7_map  = {}
     for i, d in enumerate(dates_list):
         if i == 0:
             prev7_map[d] = daily_max[d]
@@ -165,8 +165,7 @@ def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
             window = daily_max[dates_list[max(0, i-7):i]]
             prev7_map[d] = float(window.mean()) if len(window) else daily_max[d]
 
-    # Prior sazonal: P(pico já passou | month, hour, slot30)
-    # Contagem de vezes que o pico ocorreu antes ou neste slot
+    # Prior sazonal
     slot_counts = {}
     slot_peak   = {}
     for d, day_df in df.groupby("date"):
@@ -179,9 +178,6 @@ def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
             m = int(row["month"])
             key = (m, h, s)
             slot_counts[key] = slot_counts.get(key, 0) + 1
-
-            # Pico já ocorreu se hora actual > hora do pico,
-            # ou mesma hora mas slot actual >= slot do pico
             if h > peak_h or (h == peak_h and s >= peak_s):
                 slot_peak[key] = slot_peak.get(key, 0) + 1
 
@@ -196,15 +192,15 @@ def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
         month  = int(day_df["month"].iloc[0])
         doy    = int(day_df["doy"].iloc[0])
 
-        peak_idx  = day_df["temp_c"].idxmax()
-        peak_h    = int(day_df.loc[peak_idx, "hour"])
-        peak_s    = int(day_df.loc[peak_idx, "slot30"])
+        peak_idx = day_df["temp_c"].idxmax()
+        peak_h   = int(day_df.loc[peak_idx, "hour"])
+        peak_s   = int(day_df.loc[peak_idx, "slot30"])
 
         slots_so_far = []
         for _, row in day_df.iterrows():
-            h = int(row["hour"])
-            s = int(row["slot30"])
-            t = float(row["temp_c"])
+            h  = int(row["hour"])
+            s  = int(row["slot30"])
+            t  = float(row["temp_c"])
             cl = float(row["cloud_cover"])
             hu = float(row["humidity"])
 
@@ -214,34 +210,31 @@ def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
             }
             slots_so_far.append(slot_entry)
 
-            # Label: pico já ocorreu?
             label = 1 if (h > peak_h or (h == peak_h and s >= peak_s)) else 0
 
             if h < MIN_HOUR or len(slots_so_far) < 4:
                 continue
 
-            # Features
+            # ── Features V1 ────────────────────────────
             vals = [sl["temp_c"] for sl in slots_so_far]
             hums = [sl.get("humidity", 70) for sl in slots_so_far]
             n    = len(vals)
             cur  = vals[-1]
             rmax = max(vals)
 
-            def lag(k):
-                return vals[-k] if n >= k else vals[0]
-            def lagh(k):
-                return hums[-k] if n >= k else hums[0]
+            def lag(k):  return vals[-k] if n >= k else vals[0]
+            def lagh(k): return hums[-k] if n >= k else hums[0]
 
             morn_vals = [sl["temp_c"] for sl in slots_so_far[:-1] if sl["hour"] <= 12]
             mmax = max(morn_vals) if morn_vals else cur
 
-            slot_frac = (h + s/60) / 24
+            slot_frac = (h + s / 60) / 24
 
             # recent_slope
             slope_w = vals[-4:] if n >= 4 else vals
             if len(slope_w) >= 2:
-                _x = np.arange(len(slope_w), dtype=float) - (len(slope_w)-1)/2
-                _denom = float((_x*_x).sum())
+                _x = np.arange(len(slope_w), dtype=float) - (len(slope_w) - 1) / 2
+                _denom = float((_x * _x).sum())
                 slope = float((_x * np.array(slope_w)).sum() / _denom) if _denom > 0 else 0.0
             else:
                 slope = 0.0
@@ -297,12 +290,6 @@ def build_dataset(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════
 def walk_forward_train(dataset: pd.DataFrame,
                        train_xgb: bool = True) -> dict:
-    """
-    Walk-Forward Validation com expanding window.
-    Treina LightGBM (sempre) + XGBoost (opcional) em cada fold.
-
-    Fold strategy: ano de teste, todos os anteriores para treino.
-    """
     dates_sorted = sorted(dataset["date"].unique())
     years = sorted(set(d.year for d in dates_sorted))
 
@@ -312,9 +299,6 @@ def walk_forward_train(dataset: pd.DataFrame,
     all_preds_xgb = []
     all_labels    = []
     fold_results  = []
-
-    models_lgb_last = None
-    models_xgb_last = None
 
     for i, test_year in enumerate(years):
         train_mask = dataset["date"].apply(lambda d: d.year < test_year)
@@ -331,54 +315,33 @@ def walk_forward_train(dataset: pd.DataFrame,
         X_test  = test_df[FEATURE_COLS].fillna(0)
         y_test  = test_df["label"]
 
-        # ── LightGBM ──────────────────────────────────
+        # LightGBM
         lgb = LGBMClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=31,
-            min_child_samples=50,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            objective="binary",
-            metric="auc",
-            verbose=-1,
-            random_state=42,
+            n_estimators=500, learning_rate=0.05, max_depth=6,
+            num_leaves=31, min_child_samples=50, subsample=0.8,
+            colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+            objective="binary", metric="auc", verbose=-1, random_state=42,
         )
         lgb.fit(X_train, y_train)
         preds_lgb = lgb.predict_proba(X_test)[:, 1]
         auc_lgb   = roc_auc_score(y_test, preds_lgb)
-        models_lgb_last = lgb
 
-        # ── XGBoost ───────────────────────────────────
-        auc_xgb = None
-        preds_xgb = None
-        models_xgb_last = None
+        # XGBoost
+        auc_xgb    = None
+        preds_xgb  = None
         if train_xgb:
             xgb = XGBClassifier(
-                n_estimators=500,
-                learning_rate=0.05,
-                max_depth=6,
-                max_leaves=31,
-                min_child_weight=50,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
-                objective="binary:logistic",
-                eval_metric="auc",
-                verbosity=0,
-                random_state=42,
-                use_label_encoder=False,
+                n_estimators=500, learning_rate=0.05, max_depth=6,
+                max_leaves=31, min_child_weight=50, subsample=0.8,
+                colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+                objective="binary:logistic", eval_metric="auc",
+                verbosity=0, random_state=42, use_label_encoder=False,
             )
             xgb.fit(X_train, y_train)
             preds_xgb = xgb.predict_proba(X_test)[:, 1]
             auc_xgb   = roc_auc_score(y_test, preds_xgb)
-            models_xgb_last = xgb
 
-        # Ensemble AUC
+        # Ensemble
         if preds_xgb is not None:
             preds_ens = 0.6 * preds_lgb + 0.4 * preds_xgb
             auc_ens   = roc_auc_score(y_test, preds_ens)
@@ -392,28 +355,21 @@ def walk_forward_train(dataset: pd.DataFrame,
 
         xgb_str = f"  XGB AUC={auc_xgb:.4f}" if auc_xgb else ""
         print(f"    Fold {test_year}: LGBM AUC={auc_lgb:.4f}{xgb_str}  "
-              f"Ensemble AUC={auc_ens:.4f}  "
-              f"train={len(train_df):,}  test={len(test_df):,}")
+              f"Ensemble AUC={auc_ens:.4f}")
 
         fold_results.append({
-            "year": test_year,
-            "auc_lgb": round(auc_lgb, 4),
+            "year": test_year, "auc_lgb": round(auc_lgb, 4),
             "auc_xgb": round(auc_xgb, 4) if auc_xgb else None,
             "auc_ens": round(auc_ens, 4),
-            "n_train": len(train_df),
-            "n_test":  len(test_df),
+            "n_train": len(train_df), "n_test": len(test_df),
         })
 
-    # Global AUC
     global_auc_lgb = roc_auc_score(all_labels, all_preds_lgb)
     global_auc_xgb = roc_auc_score(all_labels, all_preds_xgb) if all_preds_xgb else None
-    if all_preds_xgb:
-        global_auc_ens = roc_auc_score(
-            all_labels,
-            [0.6*l + 0.4*x for l, x in zip(all_preds_lgb, all_preds_xgb)]
-        )
-    else:
-        global_auc_ens = global_auc_lgb
+    global_auc_ens = roc_auc_score(
+        all_labels,
+        [0.6*l + 0.4*x for l, x in zip(all_preds_lgb, all_preds_xgb)]
+    ) if all_preds_xgb else global_auc_lgb
 
     print(f"\n  Global Walk-Forward AUC:")
     print(f"    LightGBM : {global_auc_lgb:.4f}")
@@ -422,12 +378,10 @@ def walk_forward_train(dataset: pd.DataFrame,
     print(f"    Ensemble : {global_auc_ens:.4f}")
 
     return {
-        "models_lgb_last": models_lgb_last,
-        "models_xgb_last": models_xgb_last,
-        "global_auc_lgb":  global_auc_lgb,
-        "global_auc_xgb":  global_auc_xgb,
-        "global_auc_ens":  global_auc_ens,
-        "fold_results":    fold_results,
+        "global_auc_lgb": global_auc_lgb,
+        "global_auc_xgb": global_auc_xgb,
+        "global_auc_ens": global_auc_ens,
+        "fold_results":   fold_results,
     }
 
 
@@ -435,47 +389,26 @@ def walk_forward_train(dataset: pd.DataFrame,
 #  FINAL TRAIN (todos os dados)
 # ══════════════════════════════════════════════════════
 def train_final(dataset: pd.DataFrame, train_xgb: bool = True) -> tuple:
-    """Treina modelos finais em TODOS os dados."""
     X = dataset[FEATURE_COLS].fillna(0)
     y = dataset["label"]
 
-    # LightGBM
     lgb = LGBMClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
-        min_child_samples=50,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        objective="binary",
-        metric="auc",
-        verbose=-1,
-        random_state=42,
+        n_estimators=500, learning_rate=0.05, max_depth=6,
+        num_leaves=31, min_child_samples=50, subsample=0.8,
+        colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+        objective="binary", metric="auc", verbose=-1, random_state=42,
     )
     lgb.fit(X, y)
     print(f"  LightGBM treinado em {len(X):,} samples")
 
-    # XGBoost
     xgb = None
     if train_xgb:
         xgb = XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
-            max_leaves=31,
-            min_child_weight=50,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            objective="binary:logistic",
-            eval_metric="auc",
-            verbosity=0,
-            random_state=42,
-            use_label_encoder=False,
+            n_estimators=500, learning_rate=0.05, max_depth=6,
+            max_leaves=31, min_child_weight=50, subsample=0.8,
+            colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
+            objective="binary:logistic", eval_metric="auc",
+            verbosity=0, random_state=42, use_label_encoder=False,
         )
         xgb.fit(X, y)
         print(f"  XGBoost treinado em {len(X):,} samples")
@@ -487,39 +420,25 @@ def train_final(dataset: pd.DataFrame, train_xgb: bool = True) -> tuple:
 #  THRESHOLD ADAPTATIVO — curva DOY contínua
 # ══════════════════════════════════════════════════════
 def compute_doy_threshold(dataset: pd.DataFrame, degree: int = 5) -> np.ndarray:
-    """
-    Ajusta um polinómio à probabilidade óptima de threshold por dia do ano.
-    Para cada DOY, encontra o threshold que maximiza F1 (correct detection).
-    """
-    from sklearn.metrics import f1_score
-
     doy_thresholds = {}
     for doy in range(1, 366):
         sub = dataset[dataset["doy"] == doy]
         if len(sub) < 20:
             continue
-
-        preds = sub["seasonal_peak_prior"].values
+        preds  = sub["seasonal_peak_prior"].values
         labels = sub["label"].values
-
-        best_thr = 0.5
-        best_f1  = 0.0
+        best_thr, best_f1 = 0.5, 0.0
         for thr in np.arange(0.3, 0.95, 0.05):
-            pred_binary = (preds >= thr).astype(int)
-            f1 = f1_score(labels, pred_binary, zero_division=0)
+            pred_bin = (preds >= thr).astype(int)
+            f1 = f1_score(labels, pred_bin, zero_division=0)
             if f1 > best_f1:
-                best_f1  = f1
-                best_thr = thr
-
+                best_f1, best_thr = f1, thr
         doy_thresholds[doy] = best_thr
 
-    # Ajustar polinómio
-    doys  = np.array(list(doy_thresholds.keys()))
-    thrs  = np.array(list(doy_thresholds.values()))
+    doys      = np.array(list(doy_thresholds.keys()))
+    thrs      = np.array(list(doy_thresholds.values()))
     doys_norm = (doys - 183) / 183
-    coeffs = np.polyfit(doys_norm, thrs, degree)
-
-    return coeffs
+    return np.polyfit(doys_norm, thrs, degree)
 
 
 # ══════════════════════════════════════════════════════
@@ -529,32 +448,26 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
                 train_xgb: bool = True):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # LightGBM
     joblib.dump(lgb, OUTPUT_DIR / "lgbm_peak.pkl")
     print(f"  ✓ {OUTPUT_DIR / 'lgbm_peak.pkl'}")
 
-    # XGBoost
     if xgb is not None:
         joblib.dump(xgb, OUTPUT_DIR / "xgb_peak.pkl")
         print(f"  ✓ {OUTPUT_DIR / 'xgb_peak.pkl'}")
 
-    # Config
     config = {
-        "feature_cols":      FEATURE_COLS,
-        "resolution":        "30min_ceiling",
-        "global_auc":        round(wf_results["global_auc_lgb"], 4),
-        "global_auc_xgb":    round(wf_results["global_auc_xgb"], 4) if wf_results.get("global_auc_xgb") else None,
-        "global_auc_ens":    round(wf_results["global_auc_ens"], 4),
-        "fold_results":      wf_results.get("fold_results", []),
-        "doy_poly_coeffs":   doy_poly.tolist() if doy_poly is not None else None,
-        "ensemble_weights":  {
-            "lgbm":   0.50,
-            "xgb":    0.30 if train_xgb else 0.0,
-            "zscore": 0.20,
+        "feature_cols":     FEATURE_COLS,
+        "resolution":       "30min_ceiling",
+        "global_auc":       round(wf_results["global_auc_lgb"], 4),
+        "global_auc_xgb":   round(wf_results["global_auc_xgb"], 4) if wf_results.get("global_auc_xgb") else None,
+        "global_auc_ens":   round(wf_results["global_auc_ens"], 4),
+        "fold_results":     wf_results.get("fold_results", []),
+        "doy_poly_coeffs":  doy_poly.tolist() if doy_poly is not None else None,
+        "ensemble_weights": {
+            "lgbm": 0.50, "xgb": 0.30 if train_xgb else 0.0, "zscore": 0.20,
         },
     }
 
-    # Prior sazonal
     prior_str = {}
     for (m, h, s), v in prior_map.items():
         prior_str[f"{m}_{h}_{s}"] = v
@@ -570,14 +483,12 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
 #  MAIN
 # ══════════════════════════════════════════════════════
 def main():
-    import argparse
     parser = argparse.ArgumentParser(description="Munich Peak Model Trainer V3")
     parser.add_argument("--no-xgb", action="store_true",
-                        help="Não treinar XGBoost (só LightGBM)")
+                        help="Não treinar XGBoost")
     parser.add_argument("--no-wf", action="store_true",
                         help="Skip walk-forward validation")
-    parser.add_argument("--doy-degree", type=int, default=5,
-                        help="Grau do polinómio DOY threshold (default: 5)")
+    parser.add_argument("--doy-degree", type=int, default=5)
     args = parser.parse_args()
 
     train_xgb = not args.no_xgb
@@ -592,44 +503,31 @@ def main():
     print("\n[2/5] A construir dataset...")
     dataset, prior_map = build_dataset(df)
 
-    # Walk-Forward
     wf_results = None
     if not args.no_wf:
         print("\n[3/5] Walk-Forward Validation...")
         wf_results = walk_forward_train(dataset, train_xgb=train_xgb)
 
-    # Treino final
     print("\n[4/5] Treino final (todos os dados)...")
     lgb, xgb = train_final(dataset, train_xgb=train_xgb)
 
-    # Se não fizemos WF, calcular AUC no treino
     if wf_results is None:
         X = dataset[FEATURE_COLS].fillna(0)
         y = dataset["label"]
         preds_lgb = lgb.predict_proba(X)[:, 1]
-        from sklearn.metrics import roc_auc_score
         wf_results = {
             "global_auc_lgb": roc_auc_score(y, preds_lgb),
-            "global_auc_xgb": None,
-            "global_auc_ens": roc_auc_score(y, preds_lgb),
+            "global_auc_xgb": None, "global_auc_ens": roc_auc_score(y, preds_lgb),
             "fold_results": [],
         }
 
-    # DOY threshold
     print("\n[5/5] A calcular threshold adaptativo...")
     doy_poly = compute_doy_threshold(dataset, degree=args.doy_degree)
 
-    # Save
     print("\nA guardar modelos...")
     save_models(lgb, xgb, prior_map, doy_poly, wf_results, train_xgb=train_xgb)
 
     print("\n✅ Treino completo!")
-    if train_xgb:
-        print(f"   LightGBM  AUC: {wf_results['global_auc_lgb']:.4f}")
-        print(f"   XGBoost   AUC: {wf_results.get('global_auc_xgb', 'N/A')}")
-        print(f"   Ensemble  AUC: {wf_results['global_auc_ens']:.4f}")
-    else:
-        print(f"   LightGBM  AUC: {wf_results['global_auc_lgb']:.4f}")
 
 
 if __name__ == "__main__":
