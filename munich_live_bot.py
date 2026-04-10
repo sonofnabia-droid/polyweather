@@ -119,7 +119,7 @@ def get_real_usdc_balance(private_key: str) -> float | None:
 # ══════════════════════════════════════════════════════
 #  DUPLA CONDIÇÃO: VALIDAÇÃO DE MERCADO
 # ══════════════════════════════════════════════════════
-def market_confirms_bracket(bracket: dict | None, min_ask: float = 0.10, max_ask: float = 0.90) -> tuple[bool, str]:
+def market_confirms_bracket(bracket: dict | None, min_ask: float = 0.10, max_ask: float = 0.95) -> tuple[bool, str]:
     """
     Verifica se o mercado oferece liquidez e preço razoável (Edge).
     
