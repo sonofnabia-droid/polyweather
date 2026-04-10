@@ -7,7 +7,7 @@ Estratégia:
   - Ensemble: LightGBM (50%) + XGBoost (30%) + Z-Score Streaming (20%)
   - Dupla Confirmação: Modelo + Mercado (bracket com MAIOR ask)
   - Entrada faseada em 3 parcelas de $5:
-      P1: Manhã cedo + Forecast agreement (WU + Open-Meteo)
+      P1: 10h<=hora<12h + Forecast agreement + Mercado confirma + p>=30%
       P2: Modelo >= 60% + Mercado confirma (highest ask = running max)
       P3: Modelo >= 80%
 
@@ -35,7 +35,7 @@ from munich_config import (
     WU_API_KEY, POLY_PRIVATE_KEY, POLY_MAX_DAILY_LOSS,
     LOG_DIR, GAMMA_API, MONTH_NAMES,
     DAY_START, DAY_END, MIN_HOUR,
-    _SIGNAL_CHECK_WINDOWS, FORECAST_AGREEMENT_TOLERANCE,
+    _SIGNAL_CHECK_WINDOWS,
     berlin_now, berlin_date, local_now, ceil_slot, smart_sleep,
 )
 from munich_weather import (
@@ -50,6 +50,7 @@ from munich_model import (
     set_seasonal_prior, compute_prev7,
     init_history_max, update_history_max,
 )
+from munich_phased_entry import PhasedEntry
 from munich_display import display, log_tick
 from polymarket_clob import (
     ClobClient, TradingMode, OrderBook,
@@ -57,111 +58,6 @@ from polymarket_clob import (
 )
 from polymarket_orders import OrderExecutor, paper_buy
 from tg import TG
-
-
-# ══════════════════════════════════════════════════════
-#  PHASED ENTRY — 3 Parcelas x $5
-# ══════════════════════════════════════════════════════
-class PhasedEntry:
-    """
-    P1: hora < 12 + forecast agreement
-    P2: p_ensemble >= 60% + mercado confirma (highest ask bracket = running max)
-    P3: p_ensemble >= 80%
-    """
-
-    def __init__(self, parcel_size: float = 5.0):
-        self.parcel_size = parcel_size
-        self.thr_p2 = 0.60
-        self.thr_p3 = 0.80
-        self.temp_tolerance = 1  # °C tolerância para matching
-        self.parcel_bought  = [False, False, False]
-        self.parcel_records = [None, None, None]
-
-    def _find_highest_ask_bracket(self, market):
-        if not market or not market.get("brackets"):
-            return None
-        return max(market["brackets"],
-                   key=lambda b: b.get("ask") or b.get("price") or 0)
-
-    def _market_confirms_model(self, market, running_max):
-        best = self._find_highest_ask_bracket(market)
-        if best is None:
-            return False, "sem mercado"
-
-        best_ask  = best.get("ask") or best.get("price") or 0
-        best_lo   = best["temp_lo"]
-        best_hi   = best["temp_hi"]
-        best_label = best["label"]
-        rmax_int  = int(round(running_max))
-
-        if best_lo <= -99:
-            return False, f"mercado={best_label} (or lower, não pico)"
-
-        if best_lo <= rmax_int <= best_hi:
-            return True, f"mercado={best_label} ({best_ask*100:.0f}¢) = {rmax_int}°C"
-
-        mid = best_lo if best_hi >= 99 else (best_lo + best_hi) / 2
-        if abs(mid - rmax_int) <= self.temp_tolerance:
-            return True, f"mercado={best_label} ({best_ask*100:.0f}¢) ≈ {rmax_int}°C"
-
-        return False, f"mercado={best_label} ({best_ask*100:.0f}¢) ≠ {rmax_int}°C"
-
-    def evaluate(self, p_ensemble, hour, market, running_max, forecast_agreement):
-        actions = []
-
-        # P1
-        if not self.parcel_bought[0]:
-            fc_ok = forecast_agreement is not None and forecast_agreement.get("valid", False)
-            if hour < 12 and fc_ok:
-                actions.append({
-                    "parcel_idx": 0, "size_usdc": self.parcel_size,
-                    "reason": f"P1: manhã ({hour}h) + fc agree",
-                    "model_ok": True, "market_ok": True,
-                })
-
-        # P2
-        if not self.parcel_bought[1]:
-            model_ok = p_ensemble >= self.thr_p2
-            mkt_ok, mkt_detail = self._market_confirms_model(market, running_max)
-            if model_ok and mkt_ok:
-                actions.append({
-                    "parcel_idx": 1, "size_usdc": self.parcel_size,
-                    "reason": f"P2: p={p_ensemble*100:.0f}% + {mkt_detail}",
-                    "model_ok": True, "market_ok": True,
-                })
-            elif model_ok and not mkt_ok:
-                actions.append({
-                    "parcel_idx": 1, "size_usdc": 0,
-                    "reason": f"P2 BLOQUEADA: modelo OK, mercado NÃO ({mkt_detail})",
-                    "model_ok": True, "market_ok": False,
-                })
-
-        # P3
-        if not self.parcel_bought[2]:
-            if p_ensemble >= self.thr_p3:
-                actions.append({
-                    "parcel_idx": 2, "size_usdc": self.parcel_size,
-                    "reason": f"P3: p={p_ensemble*100:.0f}% >= 80%",
-                    "model_ok": True, "market_ok": True,
-                })
-
-        return actions
-
-    def mark_bought(self, parcel_idx, record):
-        self.parcel_bought[parcel_idx] = True
-        self.parcel_records[parcel_idx] = record
-
-    def reset(self):
-        self.parcel_bought  = [False, False, False]
-        self.parcel_records = [None, None, None]
-
-    @property
-    def total_invested(self):
-        return sum(self.parcel_size for b in self.parcel_bought if b)
-
-    @property
-    def n_parcels_bought(self):
-        return sum(self.parcel_bought)
 
 
 # ══════════════════════════════════════════════════════
@@ -179,12 +75,18 @@ def get_real_usdc_balance(private_key: str) -> float | None:
             try:
                 info = _c.get_balance_allowance(
                     params=BalanceAllowanceParams(
-                        asset_type=AssetType.COLLATERAL, signature_type=sig))
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=sig,
+                    )
+                )
                 bal = int(info.get("balance", "0")) / 1e6
-                if bal > best: best = bal
-            except: pass
+                if bal > best:
+                    best = bal
+            except Exception:
+                pass
         return best if best > 0 else None
-    except: return None
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════
@@ -200,33 +102,42 @@ def _extract_temp(text: str) -> float | None:
                 r'([-]?\d+)\s*or\s+(?:higher|lower|above|below)',
                 r'be\s+([-]?\d+)', r'^\s*([-]?\d+)\s*$']:
         m = _re.search(pat, str(text), _re.IGNORECASE)
-        if m: return float(m.group(1))
+        if m:
+            return float(m.group(1))
     return None
 
 
 def _bracket_lo(label):
     v = _extract_temp(label)
-    if v is None: return 0.0
+    if v is None:
+        return 0.0
     s = str(label).lower()
-    if any(x in s for x in ("or lower","or below","≤","<=")): return -99.0
+    if any(x in s for x in ("or lower", "or below", "≤", "<=")):
+        return -99.0
     return v
 
 
 def _bracket_hi(label):
     v = _extract_temp(label)
-    if v is None: return 99.0
+    if v is None:
+        return 99.0
     s = str(label).lower()
-    if any(x in s for x in ("or higher","or above","≥",">=")): return 99.0
+    if any(x in s for x in ("or higher", "or above", "≥", ">=")):
+        return 99.0
     return v
 
 
 def _normalize_label(text: str) -> str:
-    if len(text) <= 25: return text
+    if len(text) <= 25:
+        return text
     v = _extract_temp(text)
-    if v is None: return text
+    if v is None:
+        return text
     s = text.lower()
-    if any(x in s for x in ("higher","above","≥",">=")): return f"{v:.0f}°C or higher"
-    if any(x in s for x in ("lower","below","≤","<=")):  return f"{v:.0f}°C or lower"
+    if any(x in s for x in ("higher", "above", "≥", ">=")):
+        return f"{v:.0f}°C or higher"
+    if any(x in s for x in ("lower", "below", "≤", "<=")):
+        return f"{v:.0f}°C or lower"
     return f"{v:.0f}°C"
 
 
@@ -239,25 +150,29 @@ def fetch_market(d: date) -> dict | None:
             r.raise_for_status()
             ev = r.json()
             return ev if isinstance(ev, list) else ([ev] if ev else [])
-        except: return []
+        except Exception:
+            return []
 
     month_s = MONTH_NAMES[d.month].capitalize()
     events = (try_api({"slug": slug}) or
               try_api({"q": f"highest temperature Munich {month_s} {d.day} {d.year}",
                        "limit": 10}) or
               try_api({"q": f"Munich temperature {d.year}", "limit": 10}))
-    if not events: return None
+    if not events:
+        return None
 
     def is_munich(e):
-        t = str(e.get("title","")).lower()
+        t = str(e.get("title", "")).lower()
         return ("munich" in t or "munchen" in t) and (
-               "temp" in t or "temperature" in t or "highest" in t)
+            "temp" in t or "temperature" in t or "highest" in t)
 
     munich = [e for e in events if isinstance(e, dict) and is_munich(e)]
-    if not munich: munich = [e for e in events if isinstance(e, dict)]
-    if not munich: return None
+    if not munich:
+        munich = [e for e in events if isinstance(e, dict)]
+    if not munich:
+        return None
 
-    event = max(munich, key=lambda e: float(e.get("volume",0) or 0))
+    event = max(munich, key=lambda e: float(e.get("volume", 0) or 0))
     brackets = []
 
     for m in event.get("markets", []):
@@ -265,17 +180,21 @@ def fetch_market(d: date) -> dict | None:
                      m.get("title") or m.get("question") or "")
         label = _normalize_label(raw_label)
         v = _extract_temp(label)
-        if v is None: continue
+        if v is None:
+            continue
 
-        outcomes  = m.get("outcomes","[]")
-        prices    = m.get("outcomePrices","[]")
-        token_ids = m.get("clobTokenIds","[]")
+        outcomes  = m.get("outcomes", "[]")
+        prices    = m.get("outcomePrices", "[]")
+        token_ids = m.get("clobTokenIds", "[]")
 
         def _jload(x):
             if isinstance(x, str):
-                try: return json.loads(x)
-                except: return []
+                try:
+                    return json.loads(x)
+                except Exception:
+                    return []
             return x
+
         outcomes  = _jload(outcomes)
         prices    = _jload(prices)
         token_ids = _jload(token_ids)
@@ -283,54 +202,73 @@ def fetch_market(d: date) -> dict | None:
         price_yes = None
         token_yes = None
         for i, out in enumerate(outcomes):
-            if str(out).lower() in ("yes","true","1"):
+            if str(out).lower() in ("yes", "true", "1"):
                 price_yes = float(prices[i]) if i < len(prices) and prices[i] else None
                 token_yes = token_ids[i] if i < len(token_ids) else None
                 break
         if price_yes is None and prices:
-            try: price_yes = float(prices[0])
-            except: price_yes = 0.5
-        if price_yes is None: continue
+            try:
+                price_yes = float(prices[0])
+            except Exception:
+                price_yes = 0.5
+        if price_yes is None:
+            continue
 
         brackets.append({
-            "label": label, "price": round(price_yes, 4),
-            "token_id": token_yes, "temp_lo": _bracket_lo(label),
-            "temp_hi": _bracket_hi(label), "volume": float(m.get("volume",0) or 0),
+            "label":    label,
+            "price":    round(price_yes, 4),
+            "token_id": token_yes,
+            "temp_lo":  _bracket_lo(label),
+            "temp_hi":  _bracket_hi(label),
+            "volume":   float(m.get("volume", 0) or 0),
         })
 
-    if not brackets: return None
+    if not brackets:
+        return None
     brackets.sort(key=lambda b: b["temp_lo"])
     return {
-        "title": event.get("title","Munich Max Temp"),
-        "end_date": event.get("endDate",""), "volume": float(event.get("volume",0) or 0),
-        "brackets": brackets, "n_outcomes": len(brackets), "slug": slug,
+        "title":      event.get("title", "Munich Max Temp"),
+        "end_date":   event.get("endDate", ""),
+        "volume":     float(event.get("volume", 0) or 0),
+        "brackets":   brackets,
+        "n_outcomes": len(brackets),
+        "slug":       slug,
     }
 
 
 def find_bracket(market: dict, temp: float) -> dict | None:
-    if not market: return None
+    if not market:
+        return None
     tr = round(temp)
     for b in market["brackets"]:
         lo, hi = b["temp_lo"], b["temp_hi"]
-        if lo == hi and tr == round(lo): return b
-        if hi == 99  and tr >= lo:       return b
-        if lo == -99 and tr <= hi:       return b
-        if lo <= temp <= hi:             return b
+        if lo == hi and tr == round(lo):
+            return b
+        if hi == 99 and tr >= lo:
+            return b
+        if lo == -99 and tr <= hi:
+            return b
+        if lo <= temp <= hi:
+            return b
     return min(market["brackets"],
-               key=lambda b: abs(tr - (b["temp_lo"] if b["temp_hi"]==99
-                                       else b["temp_hi"] if b["temp_lo"]==-99
-                                       else (b["temp_lo"]+b["temp_hi"])/2)))
+               key=lambda b: abs(tr - (b["temp_lo"] if b["temp_hi"] == 99
+                                       else b["temp_hi"] if b["temp_lo"] == -99
+                                       else (b["temp_lo"] + b["temp_hi"]) / 2)))
 
 
 def compute_ev(p: float, ask: float) -> dict | None:
-    if not ask or not (0 < ask < 1) or ask >= 0.95: return None
+    if not ask or not (0 < ask < 1) or ask >= 0.95:
+        return None
     ev    = p - ask
     b     = (1 - ask) / ask
     kelly = max(0.0, (p * b - (1 - p)) / b)
     return {
-        "ev": round(ev, 4), "ev_cents": round(ev * 100, 2),
-        "kelly": round(kelly, 4), "edge_pct": round((p / ask - 1) * 100, 2),
-        "ev_positive": ev > 0, "ask": round(ask, 4),
+        "ev":          round(ev, 4),
+        "ev_cents":    round(ev * 100, 2),
+        "kelly":       round(kelly, 4),
+        "edge_pct":    round((p / ask - 1) * 100, 2),
+        "ev_positive": ev > 0,
+        "ask":         round(ask, 4),
     }
 
 
@@ -342,27 +280,37 @@ def ask_trading_mode() -> TradingMode:
     print(f"  {C['yellow']}[P]{R} PAPER  — simula ordens, order book real")
     print(f"  {C['red']}[R]{R} REAL   — envia ordens reais")
     while True:
-        try: ans = input(f"  Modo? {C['yellow']}[P]{R}aper / {C['red']}[R]{R}eal : ").strip().lower()
-        except (EOFError, KeyboardInterrupt): raise SystemExit(0)
-        if ans in ("p","paper",""):
-            print(f"\n  {C['yellow']}{B}PAPER seleccionado{R}\n"); return TradingMode.PAPER
-        if ans in ("r","real"):
+        try:
+            ans = input(f"  Modo? {C['yellow']}[P]{R}aper / {C['red']}[R]{R}eal : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit(0)
+        if ans in ("p", "paper", ""):
+            print(f"\n  {C['yellow']}{B}PAPER seleccionado{R}\n")
+            return TradingMode.PAPER
+        if ans in ("r", "real"):
             if not POLY_PRIVATE_KEY:
-                print(f"  {C['red']}POLY_PRIVATE_KEY não definida{R}"); continue
-            try: confirm = input(f"  Escreve {C['red']}REAL{R} para confirmar: ").strip()
-            except: confirm = ""
+                print(f"  {C['red']}POLY_PRIVATE_KEY não definida{R}")
+                continue
+            try:
+                confirm = input(f"  Escreve {C['red']}REAL{R} para confirmar: ").strip()
+            except Exception:
+                confirm = ""
             if confirm == "REAL":
-                print(f"\n  {C['red']}{B}REAL activado{R}\n"); return TradingMode.REAL
-            print(f"  Confirmação inválida — PAPER\n"); return TradingMode.PAPER
+                print(f"\n  {C['red']}{B}REAL activado{R}\n")
+                return TradingMode.REAL
+            print(f"  Confirmação inválida — PAPER\n")
+            return TradingMode.PAPER
         print(f"  Opção inválida.")
 
 
 def confirm_real_order(bet: dict) -> bool:
     print(f"\n  {C['red']}{B}⚠ CONFIRMAR ORDEM REAL ⚠{R}")
     print(f"    Bracket : {bet['bracket']}  Ask: {bet['ask']*100:.1f}¢")
-    print(f"    Aposta  : ${bet['bet_size']:.2f}  Parcela: P{bet.get('parcel_idx',0)+1}")
-    try: ans = input(f"  Enviar? (y/n): ").strip().lower()
-    except: return False
+    print(f"    Aposta  : ${bet['bet_size']:.2f}  Parcela: P{bet.get('parcel_idx', 0)+1}")
+    try:
+        ans = input(f"  Enviar? (y/n): ").strip().lower()
+    except Exception:
+        return False
     return ans == "y"
 
 
@@ -374,7 +322,8 @@ def _stdin_has_input(timeout=0.0):
         import select
         r, _, _ = select.select([sys.stdin], [], [], timeout)
         return bool(r)
-    except: return False
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════
@@ -389,19 +338,25 @@ def run(wu_key: str, threshold: float, bankroll: float,
     if not wu_key:
         raise ValueError(f"\n  {C['red']}WU_API_KEY não definida{R}")
 
-    trading_mode = TradingMode.REAL if (headless and POLY_PRIVATE_KEY) else (
-                   TradingMode.REAL if (not headless and ask_trading_mode() == TradingMode.REAL) else
-                   TradingMode.PAPER)
+    # ── Modo ──────────────────────────────────────────
+    if headless:
+        trading_mode = TradingMode.REAL if POLY_PRIVATE_KEY else TradingMode.PAPER
+    else:
+        trading_mode = ask_trading_mode()
 
     tg = TG()
 
     # ── CLOB ──────────────────────────────────────────
-    clob = None
+    clob     = None
     executor = None
     if POLY_PRIVATE_KEY:
         try:
-            clob = ClobClient(private_key=POLY_PRIVATE_KEY, mode=trading_mode,
-                              max_daily_loss=POLY_MAX_DAILY_LOSS, log_dir=LOG_DIR)
+            clob = ClobClient(
+                private_key=POLY_PRIVATE_KEY,
+                mode=trading_mode,
+                max_daily_loss=POLY_MAX_DAILY_LOSS,
+                log_dir=LOG_DIR,
+            )
             executor = OrderExecutor(POLY_PRIVATE_KEY)
         except Exception as e:
             print(f"  {C['red']}CLOB init falhou: {e}{R}")
@@ -414,7 +369,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
     print("[1/4] A carregar modelos...")
     models = load_models()
     set_seasonal_prior(models["prior_map"])
-    feat_cols = models["feat_cols"]
 
     def get_threshold(month, doy=0):
         if models["doy_poly"] is not None and doy > 0:
@@ -445,21 +399,23 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
     # ── Aplicar modelo ao histórico ───────────────────
     print(f"\n[3/4] A aplicar modelo ao histórico ({len(slots_so_far)} slots)...")
-    month = today.month
-    doy   = today.timetuple().tm_yday
+    month  = today.month
+    doy    = today.timetuple().tm_yday
     signals = {}
 
     for i, slot in enumerate(slots_so_far):
         h, s = slot["hour"], slot["slot30"]
-        if h < MIN_HOUR or i < 3: continue
+        if h < MIN_HOUR or i < 3:
+            continue
         current_extra = {
             "hour": h, "slot30": s,
             "cloud_cover": slot.get("cloud_cover", 50),
-            "humidity": slot.get("humidity", 70),
+            "humidity":    slot.get("humidity", 70),
             "prev_7d_avg_max": compute_prev7(history_max, today),
         }
-        ens = predict_ensemble(models, feat_cols, slots_so_far[:i+1],
-                               current_extra, month, doy, zscore)
+        # ASSINATURA: predict_ensemble(models, slots_so_far, current, month, doy, zscore)
+        ens = predict_ensemble(models, slots_so_far[:i+1],
+                              current_extra, month, doy, zscore)
         signals[(h, s)] = ens["p_ensemble"]
 
     # ── Market ────────────────────────────────────────
@@ -469,9 +425,12 @@ def run(wu_key: str, threshold: float, bankroll: float,
     if market and clob:
         market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
 
-    usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY) if (
-                   trading_mode == TradingMode.REAL and POLY_PRIVATE_KEY) else None
-    open_orders  = executor.get_open_orders() if (trading_mode == TradingMode.REAL and executor) else None
+    usdc_balance = (get_real_usdc_balance(POLY_PRIVATE_KEY)
+                   if (trading_mode == TradingMode.REAL and POLY_PRIVATE_KEY)
+                   else None)
+    open_orders = (executor.get_open_orders()
+                   if (trading_mode == TradingMode.REAL and executor)
+                   else None)
 
     # ── Log paths ─────────────────────────────────────
     log_path  = LOG_DIR / f"live_{today}.csv"
@@ -481,19 +440,26 @@ def run(wu_key: str, threshold: float, bankroll: float,
     # ── Telegram start ────────────────────────────────
     clob_mode_str = "real" if trading_mode == TradingMode.REAL else "paper"
     eff_thr = get_threshold(today.month)
-    tg.alert_started(clob_mode_str, bankroll, threshold, eff_thr, today.month, market, today)
-    if not market: tg.alert_no_market(today)
+    tg.alert_started(clob_mode_str, bankroll, threshold, eff_thr,
+                     today.month, market, today)
+    if not market:
+        tg.alert_no_market(today)
 
-    _tg_last_dashboard = 0
+    _tg_last_dashboard    = 0
     _tg_dashboard_interval = 30 * 60
 
-    # ── Main Loop ─────────────────────────────────────
+    # ── Latest obs ────────────────────────────────────
     latest_obs = None
     if slots_so_far:
         last = slots_so_far[-1]
-        latest_obs = {"temp_c": last["temp_c"], "humidity": last.get("humidity",70),
-                      "cloud_cover": last.get("cloud_cover",50), "wx": "",
-                      "hour": last["hour"], "minute": last["slot30"]}
+        latest_obs = {
+            "temp_c":      last["temp_c"],
+            "humidity":    last.get("humidity", 70),
+            "cloud_cover": last.get("cloud_cover", 50),
+            "wx":          "",
+            "hour":        last["hour"],
+            "minute":      last["slot30"],
+        }
 
     print(f"\n  {DIM}Loop iniciado — Ctrl+C para parar{R}\n")
 
@@ -504,19 +470,28 @@ def run(wu_key: str, threshold: float, bankroll: float,
             # ── Novo dia ──────────────────────────────
             station_date = berlin_date()
             if station_date != today:
-                today = station_date
+                today       = station_date
                 market_date = today
-                slots_so_far = []; series_today = {}; obs_min_today = {}
-                temps_by_hour = {}; cloud_by_hour = {}; signals = {}
-                phased.reset(); zscore.reset(); bets = []
+                slots_so_far  = []
+                series_today  = {}
+                obs_min_today = {}
+                temps_by_hour = {}
+                cloud_by_hour = {}
+                signals       = {}
+                phased.reset()
+                zscore.reset()
+                bets = []
                 log_path  = LOG_DIR / f"live_{today}.csv"
                 bets_path = LOG_DIR / f"bets_{today}.json"
-                month = today.month; doy = today.timetuple().tm_yday
+                month = today.month
+                doy   = today.timetuple().tm_yday
                 latest_obs = None
 
                 market = fetch_market(market_date)
                 if market and clob:
-                    market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
+                    market["brackets"] = [
+                        clob.enrich_bracket(b) for b in market["brackets"]
+                    ]
 
                 try:
                     series_today, slots_so_far = bootstrap_today(wu_key, wu_sess)
@@ -528,34 +503,39 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     print(f"  {C['yellow']}Bootstrap falhou: {e}{R}")
 
                 update_history_max(history_max, slots_so_far)
+
                 wu_forecast = fetch_wu_forecast_max(wu_key, wu_sess)
                 om_forecast = fetch_om_forecast_max(om_sess)
                 forecast_agreement = forecasts_agree(wu_forecast, om_forecast)
 
                 tg.alert_started(clob_mode_str, bankroll, threshold,
-                                 get_threshold(today.month), today.month, market, today)
+                                 get_threshold(today.month), today.month,
+                                 market, today)
 
             # ── WU latest ─────────────────────────────
             new_obs = fetch_wu_latest(wu_key, wu_sess)
             if new_obs:
                 latest_obs = new_obs
                 h_obs, m_obs = new_obs["hour"], new_obs["minute"]
-                h_slot, s30 = ceil_slot(h_obs, m_obs)
+                h_slot, s30  = ceil_slot(h_obs, m_obs)
 
                 if DAY_START <= h_slot <= DAY_END:
-                    series_today[(h_slot, s30)] = new_obs["temp_c"]
+                    series_today[(h_slot, s30)]  = new_obs["temp_c"]
                     obs_min_today[(h_slot, s30)] = (h_obs, m_obs)
 
                     slot_entry = {
-                        "hour": h_slot, "slot30": s30, "temp_c": new_obs["temp_c"],
+                        "hour": h_slot, "slot30": s30,
+                        "temp_c": new_obs["temp_c"],
                         "cloud_cover": new_obs.get("cloud_cover", 50),
                         "humidity": new_obs.get("humidity", 70),
                     }
-                    exists = any(sl["hour"] == h_slot and sl["slot30"] == s30 for sl in slots_so_far)
+                    exists = any(sl["hour"] == h_slot and sl["slot30"] == s30
+                                 for sl in slots_so_far)
                     if exists:
                         for sl in slots_so_far:
                             if sl["hour"] == h_slot and sl["slot30"] == s30:
-                                sl.update(slot_entry); break
+                                sl.update(slot_entry)
+                                break
                     else:
                         slots_so_far.append(slot_entry)
                         slots_so_far.sort(key=lambda x: x["hour"]*60 + x["slot30"])
@@ -575,11 +555,13 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 current_extra = {
                     "hour": h_cur, "slot30": s30_cur,
                     "cloud_cover": cloud_by_hour.get(h_cur, 50.0),
-                    "humidity": latest_obs.get("humidity", 70) if latest_obs else 70,
+                    "humidity": (latest_obs.get("humidity", 70)
+                                if latest_obs else 70),
                     "prev_7d_avg_max": compute_prev7(history_max, today),
                 }
+                # ASSINATURA CORRECTA: 6 args, sem feat_cols
                 ensemble_result = predict_ensemble(
-                    models, feat_cols, slots_so_far, current_extra,
+                    models, slots_so_far, current_extra,
                     month, doy, zscore
                 )
                 p = ensemble_result["p_ensemble"]
@@ -595,23 +577,33 @@ def run(wu_key: str, threshold: float, bankroll: float,
             if now.minute % 10 == 0 or not market:
                 market = fetch_market(market_date)
                 if market and clob:
-                    market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
+                    market["brackets"] = [
+                        clob.enrich_bracket(b) for b in market["brackets"]
+                    ]
 
             # ── Running max ───────────────────────────
             if series_today:
                 rmax_slot = max(series_today, key=series_today.get)
                 rmax = series_today[rmax_slot]
+                rmax_time_str = (f"{obs_min_today.get(rmax_slot, (rmax_slot[0],0))[0]}:"
+                                 f"{obs_min_today.get(rmax_slot, (0,0))[1]:02d}")
             elif temps_by_hour:
                 rmax = max(temps_by_hour.values())
+                rmax_time_str = f"{max(temps_by_hour, key=temps_by_hour.get)}h"
             else:
                 rmax = 0
+                rmax_time_str = "?"
 
             # ── Phased Entry ──────────────────────────
-            actions = phased.evaluate(p, h_cur, market, rmax, forecast_agreement)
+            actions = phased.evaluate(
+                p, h_cur, market, rmax, forecast_agreement
+            )
 
             # ── Executar parcelas ─────────────────────
-            bet = None
+            bet                = None
             bet_blocked_reason = None
+            target_bracket     = None
+            ev                 = None
 
             for action in actions:
                 if action["size_usdc"] <= 0:
@@ -622,69 +614,82 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 # Escolher bracket
                 if pidx == 1 and market:
-                    # P2: bracket com MAIOR ask (confirmação do mercado)
-                    target_bracket = max(market["brackets"],
-                                         key=lambda b: b.get("ask") or b.get("price") or 0)
+                    target_bracket = max(
+                        market["brackets"],
+                        key=lambda b: b.get("ask") or b.get("price") or 0
+                    )
                 else:
-                    # P1, P3: bracket do running max
                     target_bracket = find_bracket(market, rmax)
 
                 if not target_bracket:
-                    bet_blocked_reason = f"P{pidx+1}: sem bracket"; continue
+                    bet_blocked_reason = f"P{pidx+1}: sem bracket"
+                    continue
 
-                ask_price = target_bracket.get("ask") or target_bracket.get("price")
+                ask_price = (target_bracket.get("ask")
+                             or target_bracket.get("price"))
                 if not ask_price:
-                    bet_blocked_reason = f"P{pidx+1}: sem ask"; continue
+                    bet_blocked_reason = f"P{pidx+1}: sem ask"
+                    continue
 
                 ev = compute_ev(p, ask_price)
+
                 bet_record = {
                     "parcel_idx": pidx,
-                    "mode": trading_mode.value,
-                    "bracket": target_bracket["label"],
-                    "token_id": target_bracket.get("token_id"),
-                    "ask": round(ask_price, 4),
-                    "bid": round(target_bracket.get("bid") or ask_price, 4),
-                    "spread": round(target_bracket.get("spread") or 0, 4),
-                    "p_true": round(p, 3),
-                    "ev_cents": ev["ev_cents"] if ev else None,
-                    "edge_pct": ev["edge_pct"] if ev else None,
-                    "bet_size": action["size_usdc"],
-                    "shares": round(action["size_usdc"] / ask_price, 2),
-                    "max_profit": round(action["size_usdc"] / ask_price * (1 - ask_price), 2),
-                    "reason": action["reason"],
-                    "timestamp": datetime.now().isoformat(),
+                    "mode":       trading_mode.value,
+                    "bracket":    target_bracket["label"],
+                    "token_id":   target_bracket.get("token_id"),
+                    "ask":        round(ask_price, 4),
+                    "bid":        round(target_bracket.get("bid") or ask_price, 4),
+                    "spread":     round(target_bracket.get("spread") or 0, 4),
+                    "p_true":     round(p, 3),
+                    "ev_cents":   ev["ev_cents"] if ev else None,
+                    "edge_pct":   ev["edge_pct"] if ev else None,
+                    "bet_size":   action["size_usdc"],
+                    "shares":     round(action["size_usdc"] / ask_price, 2),
+                    "max_profit": round(
+                        action["size_usdc"] / ask_price * (1 - ask_price), 2),
+                    "reason":     action["reason"],
+                    "timestamp":  datetime.now().isoformat(),
                 }
 
                 # Executar
                 if trading_mode == TradingMode.PAPER:
                     result = paper_buy(
-                        token_id=target_bracket.get("token_id",""),
-                        price=ask_price, size_usdc=action["size_usdc"],
-                        label=f"P{pidx+1}: {target_bracket['label']}")
+                        token_id  = target_bracket.get("token_id", ""),
+                        price     = ask_price,
+                        size_usdc = action["size_usdc"],
+                        label     = f"P{pidx+1}: {target_bracket['label']}",
+                    )
                     bet_record["order_id"] = result["order_id"]
                     bet_record["status"]   = result["status"]
                     bet = bet_record
                     phased.mark_bought(pidx, bet_record)
                     bets.append(bet)
-                    bets_path.write_text(json.dumps(bets, indent=2, default=str))
+                    bets_path.write_text(
+                        json.dumps(bets, indent=2, default=str))
 
                 else:  # REAL
                     if headless or confirm_real_order(bet_record):
                         if executor:
                             result = executor.buy(
-                                token_id=target_bracket.get("token_id",""),
-                                price=ask_price, size_usdc=action["size_usdc"],
-                                label=f"P{pidx+1}: {target_bracket['label']}")
+                                token_id  = target_bracket.get("token_id", ""),
+                                price     = ask_price,
+                                size_usdc = action["size_usdc"],
+                                label     = f"P{pidx+1}: {target_bracket['label']}",
+                            )
                             if result["success"]:
                                 bet_record["order_id"] = result["order_id"]
                                 bet_record["status"]   = result["status"]
                                 bet = bet_record
                                 phased.mark_bought(pidx, bet_record)
                                 bets.append(bet)
-                                bets_path.write_text(json.dumps(bets, indent=2, default=str))
-                                usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
+                                bets_path.write_text(
+                                    json.dumps(bets, indent=2, default=str))
+                                usdc_balance = get_real_usdc_balance(
+                                    POLY_PRIVATE_KEY)
                             else:
-                                bet_blocked_reason = f"P{pidx+1}: ordem falhou"
+                                bet_blocked_reason = (
+                                    f"P{pidx+1}: ordem falhou")
                         else:
                             bet_blocked_reason = "executor não disponível"
                     else:
@@ -692,15 +697,12 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 # Telegram
                 if bet:
-                    if pidx == 0:  # Primeira parcela = pico detectado
-                        rmax_time_str = "?"
-                        if series_today:
-                            rs = max(series_today, key=series_today.get)
-                            obs = obs_min_today.get(rs)
-                            rmax_time_str = f"{obs[0]}:{obs[1]:02d}" if obs else f"{rs[0]}h"
+                    if pidx == 0:
                         tg.alert_peak_detected(
-                            p_ensemble=p, rmax=rmax, rmax_time=rmax_time_str,
-                            bracket=target_bracket, ensemble_result=ensemble_result,
+                            p_ensemble=p, rmax=rmax,
+                            rmax_time=rmax_time_str,
+                            bracket=target_bracket,
+                            ensemble_result=ensemble_result,
                             market=market)
                     else:
                         tg.alert_order_placed(bet, clob_mode_str)
@@ -714,63 +716,66 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     signals_by_hour[sh] = sp
 
             temp_now = latest_obs["temp_c"] if latest_obs else 0
-            eff_thr = get_threshold(month)
-            rmax_time_str = "?"
-            if series_today:
-                rs = max(series_today, key=series_today.get)
-                obs = obs_min_today.get(rs)
-                rmax_time_str = f"{obs[0]}:{obs[1]:02d}" if obs else f"{rs[0]}h"
+            eff_thr  = get_threshold(month)
 
             display(
-                now, latest_obs, temps_by_hour, series_today, signals_by_hour, p,
-                market, target_bracket if 'target_bracket' in dir() else None,
-                ev if 'ev' in dir() else None, bet,
-                len(series_today), bankroll, eff_thr, phased.n_parcels_bought > 0,
-                trading_mode=trading_mode,
-                daily_loss=clob.daily_loss() if clob else 0.0,
-                max_daily_loss=POLY_MAX_DAILY_LOSS,
-                usdc_balance=usdc_balance,
-                positions=clob.positions if clob else None,
-                bet_blocked_reason=bet_blocked_reason,
-                bet_placed=phased.n_parcels_bought > 0,
-                forecast_max=wu_forecast,
-                berlin_now_dt=berlin_now(),
-                market_date=market_date,
-                executor=executor,
-                open_orders=open_orders,
-                obs_min_today=obs_min_today,
-                phased=phased,
-                forecast_agreement=forecast_agreement,
-                om_forecast=om_forecast,
-                ensemble_result=ensemble_result,
+                now, latest_obs, temps_by_hour, series_today,
+                signals_by_hour, p,
+                market, target_bracket, ev, bet,
+                len(series_today), bankroll, eff_thr,
+                phased.n_parcels_bought > 0,
+                trading_mode       = trading_mode,
+                daily_loss         = clob.daily_loss() if clob else 0.0,
+                max_daily_loss     = POLY_MAX_DAILY_LOSS,
+                usdc_balance       = usdc_balance,
+                positions          = clob.positions if clob else None,
+                bet_blocked_reason = bet_blocked_reason,
+                bet_placed         = phased.n_parcels_bought > 0,
+                forecast_max       = wu_forecast,
+                berlin_now_dt      = berlin_now(),
+                market_date        = market_date,
+                executor           = executor,
+                open_orders        = open_orders,
+                obs_min_today      = obs_min_today,
+                phased             = phased,
+                forecast_agreement = forecast_agreement,
+                om_forecast        = om_forecast,
+                ensemble_result    = ensemble_result,
             )
 
-            log_tick(now, temp_now, p, phased.n_parcels_bought > 0,
-                     target_bracket if 'target_bracket' in dir() else None,
-                     ev if 'ev' in dir() else None, bet, log_path,
-                     trading_mode=trading_mode,
-                     bet_blocked_reason=bet_blocked_reason)
+            log_tick(
+                now, temp_now, p, phased.n_parcels_bought > 0,
+                target_bracket, ev, bet, log_path,
+                trading_mode       = trading_mode,
+                bet_blocked_reason = (bet_blocked_reason
+                                     if not bet else None),
+            )
 
             # ── Telegram dashboard periódica ───────────
             if time.time() - _tg_last_dashboard >= _tg_dashboard_interval:
                 _tg_last_dashboard = time.time()
-                chart = draw_chart_plain(series_today, signals_by_hour, phased.n_parcels_bought > 0)
+                chart = draw_chart_plain(
+                    series_today, signals_by_hour,
+                    phased.n_parcels_bought > 0)
                 tg.dashboard(
-                    today=today, p=p, rmax=rmax, rmax_time=rmax_time_str,
-                    temp_now=temp_now, forecast_max=wu_forecast, market=market,
-                    bracket=target_bracket if 'target_bracket' in dir() else None,
-                    ev=ev if 'ev' in dir() else None,
+                    today=today, p=p, rmax=rmax,
+                    rmax_time=rmax_time_str,
+                    temp_now=temp_now, forecast_max=wu_forecast,
+                    market=market, bracket=target_bracket,
+                    ev=ev,
                     peak_detected=phased.n_parcels_bought > 0,
-                    bet=bets[-1] if bets else None, clob_mode=clob_mode_str,
+                    bet=bets[-1] if bets else None,
+                    clob_mode=clob_mode_str,
                     chart=chart, om_forecast=om_forecast,
                     forecast_agreement=forecast_agreement,
                     ensemble_result=ensemble_result,
-                    positions_summary=clob.positions.pnl_summary() if clob else None,
+                    positions_summary=(clob.positions.pnl_summary()
+                                       if clob else None),
                 )
 
             # ── Sleep ─────────────────────────────────
             _berlin_h = berlin_now().hour
-            _last_t = latest_obs["temp_c"] if latest_obs else None
+            _last_t   = latest_obs["temp_c"] if latest_obs else None
             if _berlin_h < 8 or _berlin_h >= 21:
                 time.sleep(300)
             else:
@@ -782,20 +787,20 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
 
 def draw_chart_plain(series_today, signals, peak_detected):
-    """Versão plain do chart para Telegram (sem ANSI)."""
     lines = []
-    slots = [(h, m) for h in range(DAY_START, DAY_END + 1) for m in (0, 30)]
+    slots = [(h, m)
+             for h in range(DAY_START, DAY_END + 1)
+             for m in (0, 30)]
     temps = [series_today.get(s) for s in slots]
     avail = [t for t in temps if t is not None]
-    if not avail: return ["sem dados"]
-    t_min, t_max = min(avail) - 0.5, max(avail) + 0.5
-    t_rng = max(t_max - t_min, 1.0)
-    chart_h = 6
+    if not avail:
+        return ["sem dados"]
     for si, ((h, m), temp) in enumerate(zip(slots, temps)):
-        if temp is None: continue
-        row = int((1 - (temp - t_min) / t_rng) * (chart_h - 1))
+        if temp is None:
+            continue
         p = signals.get(h, 0)
-        sym = "▓▓" if p >= 0.80 else "▒▒" if p >= 0.60 else "░░"
+        sym = ("▓▓" if p >= 0.80 else "▒▒" if p >= 0.60
+               else "░░" if p >= 0.30 else "··")
         lines.append(f"{h:02d}:{m:02d} {int(temp):>2}°C {sym} {p*100:.0f}%")
     return lines
 
@@ -804,18 +809,26 @@ def draw_chart_plain(series_today, signals, peak_detected):
 #  MAIN
 # ══════════════════════════════════════════════════════
 def main():
-    parser = argparse.ArgumentParser(description="Munich Max Temp — Live Bot V3")
+    parser = argparse.ArgumentParser(
+        description="Munich Max Temp — Live Bot V3")
     parser.add_argument("--threshold", type=float, default=0.46)
     parser.add_argument("--bankroll",  type=float, default=200.0)
     parser.add_argument("--kelly",     type=float, default=0.5)
     parser.add_argument("--min-edge",  type=float, default=5.0)
     parser.add_argument("--interval",  type=int,   default=60)
-    parser.add_argument("--yes", "-y", action="store_true", help="Headless")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Headless")
     args = parser.parse_args()
 
-    run(wu_key=WU_API_KEY, threshold=args.threshold, bankroll=args.bankroll,
-        kelly_frac=args.kelly, min_edge=args.min_edge, interval=args.interval,
-        headless=args.yes)
+    run(
+        wu_key     = WU_API_KEY,
+        threshold  = args.threshold,
+        bankroll   = args.bankroll,
+        kelly_frac = args.kelly,
+        min_edge   = args.min_edge,
+        interval   = args.interval,
+        headless   = args.yes,
+    )
 
 
 if __name__ == "__main__":
