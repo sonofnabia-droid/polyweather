@@ -1,5 +1,6 @@
 """
 tg.py — Telegram notifier para o munich_live_bot.
+Suporta estratégia de 3 Fases com Dupla Condição.
 """
 
 import os
@@ -49,6 +50,7 @@ class TG:
             f"{mode_icon} <b>Munich Bot arrancou</b>  {today}",
             f"  Modo: <b>{mode.upper()}</b>   Bankroll: <b>${bankroll:.2f}</b>",
             f"  Threshold: {thr_str}",
+            f"  🎯 <i>Estratégia: 3 Fases ($5.50 cada, Dupla Condição)</i>",
             f"  {mkt}",
         ]
         return self.send("\n".join(lines))
@@ -83,9 +85,11 @@ class TG:
         shares   = bet.get("shares", 0)
         profit   = bet.get("max_profit", 0)
         order_id = bet.get("order_id", "?")
+        phase    = bet.get("phase", "N/A")
 
         lines = [
             f"{icon} <b>Ordem colocada [{mode}]</b>",
+            f"  Fase: <b>{phase}</b>",
             f"  Bracket: <b>{bet['bracket']}</b>   Ask: {ask*100:.1f}¢",
             f"  ${size:.2f}  →  {shares:.2f} shares   max +${profit:.2f}",
             f"  ID: <code>{order_id}</code>",
@@ -186,7 +190,7 @@ class TG:
         return False
 
     # ─────────────────────────────────────────────────────────────
-    # DASHBOARD COMPLETA
+    # DASHBOARD COMPLETA (30 em 30 minutos)
     # ─────────────────────────────────────────────────────────────
 
     def dashboard(self,
@@ -205,7 +209,11 @@ class TG:
                   trading_mode: str = None,
                   chart: list | None = None,
                   reason: str = "periodic",
-                  positions_summary: dict | None = None) -> bool:
+                  positions_summary: dict | None = None,
+                  open_positions: list | None = None,
+                  usdc_balance: float | None = None,
+                  phases_done: int = 0,
+                  bet_blocked_reason: str | None = None) -> bool:
 
         # Converter modo para string robusta
         mode = trading_mode or clob_mode or "paper"
@@ -218,19 +226,47 @@ class TG:
         now_str = datetime.now().strftime("%H:%M")
 
         lines = [
-            f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode_str}]  {today}  {now_str}  │  Munich (CET/CEST) {now_str}",
-            f"  Estação: <b>{forecast_max['station'] if forecast_max and 'station' in forecast_max else 'EDDM Munich Airport (WUnderground)'}</b>",
-            f"  ◉ a verificar sinal (:{now_str[-2:]})",
-            "  ──────────────────────────────────────────────────────────",
+            f"{mode_icon} <b>Munich Max Temp — Live Bot</b>  [{mode_str}]  {today}  {now_str}  │  Munich {now_str}",
             "",
         ]
 
-        # Chart ASCII
-        if chart:
-            lines.append("🌡 <b>Curva de temperatura hoje</b>")
-            lines.append("<pre>")
-            lines.extend(chart)
-            lines.append("</pre>")
+        # Saldo (Sempre visível)
+        if usdc_balance is not None:
+            bal_icon = "💵" if usdc_balance >= 10 else "⚠️"
+            lines.append(f"{bal_icon} <b>Saldo:</b> ${usdc_balance:,.2f} USDC")
+        else:
+            lines.append("💵 Saldo: a carregar...")
+            
+        lines.append("")
+
+        # Estratégia 3 Fases
+        try:
+            from munich_live_bot import BetPhase, BET_SIZE_PER_PHASE
+            phase_map = {
+                "INITIAL": ("⏰ 10:00", "✅", "⏳"),
+                "YELLOW":  ("🟡 P>60%", "✅", "⏳"),
+                "GREEN":   ("🟢 P>80%", "✅", "⏳"),
+            }
+            total_invested_phases = 0.0
+            phase_str_list = []
+            for pname, (plabel, icon_done, icon_wait) in phase_map.items():
+                pval = BetPhase[pname]
+                if phases_done & pval:
+                    phase_str_list.append(f"{icon_done} {plabel}")
+                    total_invested_phases += BET_SIZE_PER_PHASE
+                else:
+                    phase_str_list.append(f"{icon_wait} {plabel}")
+            
+            lines.append(f"🎯 <b>Estratégia 3 Fases:</b> {' | '.join(phase_str_list)}")
+            lines.append(f"   <i>Investido: ${total_invested_phases:.2f} / ${BET_SIZE_PER_PHASE * 3:.2f}</i>")
+        except ImportError:
+            pass
+            
+        lines.append("")
+
+        # Motivo de NÃO apostar (Muito importante)
+        if bet_blocked_reason:
+            lines.append(f"🛑 <b>Bet Bloqueada:</b> <i>{bet_blocked_reason}</i>")
             lines.append("")
 
         # Temperatura
@@ -246,58 +282,54 @@ class TG:
         p_bar  = _tg_bar(p, width=10)
         peak_str = "  ✓ <b>PICO DETECTADO</b>" if peak_detected else ""
         lines += [
-            "🧠 <b>Modelo LightGBM — P(pico já ocorreu)</b>",
+            "🧠 <b>Modelo LightGBM</b>",
             f"  {p_bar}  <b>{p*100:.1f}%</b>{peak_str}",
             "",
         ]
 
-        # Mercado
-        if not market:
-            lines += ["📋 <b>Mercado</b>: ainda não abriu", ""]
-        else:
-            lines += [
-                "📋 <b>Polymarket — Mercado de Hoje</b>",
-                f"  {market['title'][:60]}",
-                f"  vol: ${market['volume']:,.0f}  brackets: {market['n_outcomes']}",
-                "",
-                "<pre>",
-                f"{'Bracket':<16} {'Ask':>5}  {'Bar':8}",
-                "─" * 32,
-            ]
-            for b in market["brackets"]:
-                arrow   = "→" if bracket and b["label"] == bracket["label"] else " "
-                ask_val = b.get("ask") or b.get("price") or 0
-                bar     = _tg_bar(ask_val, width=8)
-                lines.append(f"{arrow}{b['label']:<15} {ask_val*100:>4.0f}¢  {bar}")
-            lines.append("</pre>")
-            lines.append("")
-
-        # EV
+        # EV / Dupla Condição
         if bracket and ev:
             ev_icon = "✅" if ev["ev_positive"] else "❌"
             ask_val = ev.get("ask", bracket.get("ask", bracket.get("price", 0)))
             lines += [
-                f"📊 <b>Edge</b>  [{bracket['label']}]",
+                f"📊 <b>Edge &amp; Mercado</b>  [{bracket['label']}]",
                 f"  {ev_icon} ask {ask_val*100:.1f}¢   EV {ev['ev_cents']:+.1f}¢   edge {ev['edge_pct']:+.1f}%",
                 "",
             ]
 
-        # Bet
+        # Última aposta (se houver)
         if bet:
             simulated = bet.get("simulated", mode_str != "REAL")
-            sim_label = "PAPER" if simulated else "REAL"
+            sim_label = "🟡 PAPER" if simulated else "💰 REAL"
             ask       = bet.get("ask") or bet.get("price", 0)
             size      = bet.get("bet_size") or bet.get("size_usd", 0)
+            phase     = bet.get("phase", "N/A")
             lines += [
-                f"💰 <b>Bet {sim_label}</b>",
+                f"💸 <b>Última Bet [{sim_label}]</b> (Fase {phase})",
                 f"  {bet['bracket']}  ask {ask*100:.1f}¢",
                 f"  ${size:.2f}  →  {bet.get('shares', 0):.2f} shares   max +${bet.get('max_profit', 0):.2f}",
-                f"  ID: <code>{bet.get('order_id', '?')}</code>",
             ]
         else:
-            lines.append("💤 Sem bet ainda")
+            if not bet_blocked_reason:
+                lines.append("💤 <i>Sem apostas colocadas ainda</i>")
 
-        # P&L acumulado
+        # Posições Abertas (Lista detalhada)
+        if open_positions:
+            lines += [
+                "",
+                f"📋 <b>Posições Abertas ({len(open_positions)})</b>",
+                "<pre>",
+                f"{'Data':<12} {'Bracket':<16} {'Entrada':>7} {'Actual':>7} {'P&L':>8}",
+                "─" * 54,
+            ]
+            for pos in open_positions:
+                entry_s = f"{pos.entry_ask*100:.1f}¢"
+                mid_s = f"{pos.current_mid*100:.1f}¢" if pos.current_mid else "—"
+                pnl_s = f"{pos.pnl_usd:+.2f}" if pos.pnl_usd is not None else "  —"
+                lines.append(f"{pos.date_opened:<12} {pos.bracket_label:<16} {entry_s:>7} {mid_s:>7} {pnl_s:>8}")
+            lines.append("</pre>")
+
+        # P&L acumulado geral
         if positions_summary and (positions_summary["n_won"] + positions_summary["n_lost"]) > 0:
             s  = positions_summary
             nc = s["n_won"] + s["n_lost"]
@@ -305,16 +337,14 @@ class TG:
             wr_icon = "📈" if s["total_pnl_usd"] >= 0 else "📉"
             lines += [
                 "",
-                f"{wr_icon} <b>Resultados acumulados</b>",
+                f"{wr_icon} <b>Resultados Acumulados</b>",
                 f"  {s['n_won']}W / {s['n_lost']}L   win rate {wr:.0f}%",
                 f"  P&amp;L: <b>{s['total_pnl_usd']:+.2f}</b> ({s['total_pnl_pct']:+.1f}%)",
             ]
-            if s["n_open"] > 0:
-                lines.append(f"  Posições abertas: {s['n_open']}")
 
         # Rodapé
         reason_str = {
-            "periodic":    "⏱ periódico",
+            "periodic":    "⏱ periódico (30m)",
             "zone_change": "⚡ mudança de zona",
             "market_open": "📋 mercado abriu",
         }.get(reason, reason)

@@ -1,5 +1,5 @@
-# munich_display.py — versão reescrita com risk-first, barra adaptativa,
-# risk_used, risk_remaining, risk_per_trade, sem Kelly.
+# munich_display.py — versão com risk-first, barra adaptativa,
+# risk_used, risk_remaining, risk_per_trade, sem Kelly, e TRACKER DE 3 FASES.
 
 import csv
 import os
@@ -100,13 +100,11 @@ def draw_chart(series_today: dict, signals: dict,
         p   = signals.get(h, 0)
 
         if plain:
-            # versão Telegram (sem cores)
             if p >= 0.80:   sym = "██"
             elif p >= 0.60: sym = "▓▓"
             elif p >= 0.30: sym = "▒▒"
             else:           sym = "░░"
         else:
-            # versão terminal (com cores)
             if p >= 0.80:   sym = f"{C['green']}██{R}"
             elif p >= 0.60: sym = f"{C['yellow']}██{R}"
             elif p >= 0.30: sym = f"{C['orange']}▓▓{R}"
@@ -304,7 +302,8 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
             bet_blocked_reason=None, bet_placed=False,
             forecast_max=None, berlin_now_dt=None,
             signal_window_label="",
-            obs_min_today: dict = None):
+            obs_min_today: dict = None,
+            phases_done=None):  # NOVO PARÂMETRO
 
     os.system('clear' if os.name != 'nt' else 'cls')
     pc = p_col(p)
@@ -346,6 +345,30 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
               f"{DIM}Remaining:{R} ${risk_remaining:.2f}")
 
     print(f"  {DIM}{'─'*58}{R}")
+
+    # ─────────────────────────────────────────────────────────────
+    # PHASE TRACKER (3 Fases com Dupla Condição)
+    # ─────────────────────────────────────────────────────────────
+    if phases_done is not None:
+        try:
+            from munich_live_bot import BetPhase, BET_SIZE_PER_PHASE
+            phase_map = {
+                "INITIAL": ("10:00", C["cyan"]),
+                "YELLOW":  ("P>60%", C["yellow"]),
+                "GREEN":   ("P>80%", C["green"]),
+            }
+            total_invested_phases = 0.0
+            print(f"\n  {B}Estrategia 3 Fases:${R}", end="")
+            for pname, (plabel, pcol) in phase_map.items():
+                pval = BetPhase[pname]
+                if phases_done & pval:
+                    print(f"  {pcol}{B}✓ {plabel}{R}", end="")
+                    total_invested_phases += BET_SIZE_PER_PHASE
+                else:
+                    print(f"  {DIM}○ {plabel}{R}", end="")
+            print(f"  {DIM}(${total_invested_phases:.2f} / ${BET_SIZE_PER_PHASE * 3:.2f}){R}")
+        except ImportError:
+            pass
 
     # ─────────────────────────────────────────────────────────────
     # TEMPERATURE CHART
@@ -477,11 +500,10 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
         print(f"\n  {C['red']}{B}⛔  STOP-LOSS DIARIO ATINGIDO — novas ordens bloqueadas{R}")
 
     # ─────────────────────────────────────────────────────────────
-    # BET SECTION (risk-first, sem Kelly)
+    # BET SECTION (Dupla Condição)
     # ─────────────────────────────────────────────────────────────
-    if not bet and peak_detected and not bet_placed:
-        if bet_blocked_reason:
-            print(f"\n  {C['yellow']}⚠  Bet bloqueada: {bet_blocked_reason}{R}")
+    if not bet and bet_blocked_reason:
+        print(f"\n  {C['yellow']}⚠  Bet bloqueada: {bet_blocked_reason}{R}")
     elif bet_placed and not bet:
         mode_label = "simulada" if trading_mode == TradingMode.PAPER else "enviada"
         print(f"\n  {DIM}  Ordem ja {mode_label} anteriormente{R}")
@@ -493,6 +515,8 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
                         else f"{C['red']}{B}  ◆  ORDEM ENVIADA (REAL)   ◆{R}")
         print(f"\n  {border_col}{B}{'─'*44}{R}")
         print(f"  {header_label}")
+        phase_str = f"  Fase      : {bet.get('phase', 'N/A')}" if bet.get('phase') else ""
+        if phase_str: print(phase_str)
         print(f"    Bracket    : {bet['bracket']}")
         if bet.get('spread'):
             print(f"    Bid / Ask  : {bet.get('bid', 0)*100:.1f}¢  /  {bet['ask']*100:.1f}¢  "
@@ -500,7 +524,7 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
         else:
             print(f"    Ask        : {bet['ask']*100:.1f}¢")
 
-        print(f"    Sizing     : risk-first  (max loss ${bet['max_daily_loss']:.0f})")
+        print(f"    Sizing     : 3 Fases (fixo ${bet['bet_size']:.2f})")
         print(f"    Aposta     : ${bet['bet_size']:.2f}  ({bet['shares']:.2f} shares)")
         print(f"    Max profit : +${bet['max_profit']:.2f}")
         if bet.get('order_id'):
@@ -561,6 +585,7 @@ def log_tick(now, temp, p, peak_detected, bracket, ev, bet,
         "spread":             bracket.get("spread") if bracket else None,
         "ev_cents":           ev["ev_cents"] if ev else None,
         "bet_size":           bet["bet_size"] if bet else None,
+        "bet_phase":          bet.get("phase") if bet else None,
         "bet_placed":         bet is not None,
         "order_id":           bet.get("order_id") if bet else None,
         "bet_blocked_reason": bet_blocked_reason or "",
