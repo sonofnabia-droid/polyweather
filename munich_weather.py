@@ -1,29 +1,40 @@
 """
 munich_weather.py
 =================
-Acesso a dados meteorologicos via Weather Underground (WU) EDDM.
+Acesso a dados meteorologicos via WU EDDM + Open-Meteo.
 
 Exporta:
   make_wu_session()
+  make_om_session()
   fetch_wu_day_eddm(day, api_key, session)
   fetch_wu_latest(api_key, session)
   fetch_wu_forecast_max(api_key, session)
-  bootstrap_today(api_key, session)
+  fetch_om_forecast_max(session)          # NOVO
+  fetch_om_hourly_today(session)          # NOVO
+  bootstrap_today(api_key, session)       # WU only
+  bootstrap_om_today(session)             # NOVO
   cloud_from_series(series_today, rows_cache)
+  forecasts_agree(wu_forecast, om_forecast)  # NOVO
 """
 
 import requests
 from datetime import date, datetime, timezone as _tz
 
 from munich_config import (
-    WU_BASE, _BERLIN, DIM, C, R,
+    WU_BASE, OM_FORECAST, OM_ARCHIVE,
+    MUNICH_LAT_OM, MUNICH_LON_OM,
+    _BERLIN, DIM, C, R,
     DAY_START, DAY_END,
+    FORECAST_AGREEMENT_TOLERANCE,
     berlin_date, ceil_slot,
 )
 
-# ── URL EDDM ────────────────────────────────────────────
 WU_EDDM_URL = f"{WU_BASE}/EDDM:9:DE/observations/historical.json"
 
+
+# ══════════════════════════════════════════════════════
+#  WUNDERGROUND (inalterado)
+# ══════════════════════════════════════════════════════
 
 def make_wu_session() -> requests.Session:
     s = requests.Session()
@@ -39,11 +50,6 @@ def make_wu_session() -> requests.Session:
 
 
 def _wu_parse_obs(obs_list: list) -> list[dict]:
-    """
-    Parser para observacoes WU v1 EDDM.
-    Campo de tempo: valid_time_gmt (unix UTC) -> converter para CET/CEST (Europe/Berlin).
-    Temperatura: campo 'temp' (inteiro, graus Celsius em metric).
-    """
     clds_map = {"CLR": 0, "SKC": 0, "FEW": 12, "SCT": 37, "BKN": 75,
                 "OVC": 100, "OBS": 100, "VV": 100, "X": 100}
     rows = []
@@ -58,10 +64,8 @@ def _wu_parse_obs(obs_list: list) -> list[dict]:
             dt = datetime.fromtimestamp(int(vt), tz=_tz.utc).astimezone(_BERLIN)
         except Exception:
             continue
-
         clds_raw    = str(obs.get("clds", "") or "").upper().strip()
         cloud_cover = clds_map.get(clds_raw, 50)
-
         rows.append({
             "hour":        dt.hour,
             "minute":      dt.minute,
@@ -69,13 +73,13 @@ def _wu_parse_obs(obs_list: list) -> list[dict]:
             "humidity":    int(round(float(obs.get("rh") or 70))),
             "cloud_cover": cloud_cover,
             "wx":          str(obs.get("wx_phrase", "") or ""),
+            "source":      "WU",
         })
     return rows
 
 
 def fetch_wu_day_eddm(day: date, api_key: str,
                       session: requests.Session) -> list[dict]:
-    """WU EDDM historical — funciona para hoje e dias passados."""
     try:
         r = session.get(WU_EDDM_URL, params={
             "apiKey":    api_key,
@@ -91,10 +95,6 @@ def fetch_wu_day_eddm(day: date, api_key: str,
 
 def fetch_wu_forecast_max(api_key: str,
                           session: requests.Session) -> dict | None:
-    """
-    Previsao de temperatura maxima para hoje via WU v3 daily forecast.
-    Endpoint: api.weather.com/v3/wx/forecast/daily/5day
-    """
     url = "https://api.weather.com/v3/wx/forecast/daily/5day"
     try:
         r = session.get(url, params={
@@ -114,14 +114,13 @@ def fetch_wu_forecast_max(api_key: str,
                  if t_min_list and t_min_list[0] is not None else None)
         if t_max is None:
             return None
-        return {"temp_max": t_max, "temp_min": t_min}
+        return {"temp_max": t_max, "temp_min": t_min, "source": "WU"}
     except Exception:
         return None
 
 
 def fetch_wu_latest(api_key: str,
                     session: requests.Session) -> dict | None:
-    """Leitura mais recente — ultima observacao de hoje (data de Munich/Berlim)."""
     rows = fetch_wu_day_eddm(berlin_date(), api_key, session)
     if not rows:
         return None
@@ -130,12 +129,6 @@ def fetch_wu_latest(api_key: str,
 
 def bootstrap_today(api_key: str,
                     session: requests.Session) -> tuple[dict, list[dict]]:
-    """
-    Ao arranque: historico completo de hoje via EDDM.
-    Devolve:
-      series_today : {(hour, slot30): temp_c}  — para o grafico ASCII
-      slots_so_far : lista de dicts ordenada por tempo  — para o modelo
-    """
     today = berlin_date()
     print(f"  {DIM}WU EDDM historico {today}...{R}", end=" ", flush=True)
     rows = fetch_wu_day_eddm(today, api_key, session)
@@ -145,11 +138,8 @@ def bootstrap_today(api_key: str,
     t_vals = [r["temp_c"] for r in rows]
     print(f"{C['green']}{len(rows)} obs  "
           f"{min(t_vals)}°C – {max(t_vals)}°C{R}")
-
-    # Guardar cache para acesso externo
     bootstrap_today._rows_cache = rows
 
-    # series_today para o grafico + obs_min: timestamp real da observacao WU por slot
     series: dict[tuple, float] = {}
     obs_min: dict[tuple, tuple] = {}
     for r in rows:
@@ -157,12 +147,10 @@ def bootstrap_today(api_key: str,
         if key not in series or r["temp_c"] >= series[key]:
             series[key]  = r["temp_c"]
             obs_min[key] = (r["hour"], r["minute"])
-
     bootstrap_today._obs_min = obs_min
 
-    # slots_so_far para o modelo (lista cronologica sem duplicados por slot)
-    seen:  set[tuple]  = set()
-    slots: list[dict]  = []
+    seen: set[tuple] = set()
+    slots: list[dict] = []
     for r in sorted(rows, key=lambda x: x["hour"] * 60 + x["minute"]):
         k = ceil_slot(r["hour"], r["minute"])
         if k not in seen:
@@ -173,17 +161,213 @@ def bootstrap_today(api_key: str,
                 "temp_c":      r["temp_c"],
                 "cloud_cover": r.get("cloud_cover", 50),
                 "humidity":    r.get("humidity", 70),
+                "source":      "WU",
             })
-
     return series, slots
 
 
 def cloud_from_series(series_today: dict, rows_cache: list) -> dict[int, int]:
-    """
-    Extrai cloud_cover por hora directamente das observacoes WU EDDM.
-    Nao usa Open-Meteo — tudo vem da EDDM.
-    """
     cloud = {}
     for r in rows_cache:
         cloud[r["hour"]] = r.get("cloud_cover", 50)
     return cloud
+
+
+# ══════════════════════════════════════════════════════
+#  OPEN-METEO — NOVO
+# ══════════════════════════════════════════════════════
+
+def make_om_session() -> requests.Session:
+    """Open-Meteo não requer API key — session simples."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "MunichPeakBot/2.0",
+        "Accept":     "application/json",
+    })
+    return s
+
+
+def fetch_om_forecast_max(session: requests.Session) -> dict | None:
+    """
+    Previsão de temperatura máxima para hoje via Open-Meteo.
+    Endpoint: api.open-meteo.com/v1/forecast (gratuito, sem API key).
+    """
+    try:
+        r = session.get(OM_FORECAST, params={
+            "latitude":    MUNICH_LAT_OM,
+            "longitude":   MUNICH_LON_OM,
+            "daily":       "temperature_2m_max,temperature_2m_min,cloud_cover_mean",
+            "timezone":    "Europe/Berlin",
+            "forecast_days": 1,
+        }, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        daily = d.get("daily", {})
+        t_max_list = daily.get("temperature_2m_max", [None])
+        t_min_list = daily.get("temperature_2m_min", [None])
+        cloud_list = daily.get("cloud_cover_mean", [None])
+
+        t_max = t_max_list[0] if t_max_list and t_max_list[0] is not None else None
+        t_min = t_min_list[0] if t_min_list and t_min_list[0] is not None else None
+        cloud = cloud_list[0] if cloud_list and cloud_list[0] is not None else None
+
+        if t_max is None:
+            return None
+
+        return {
+            "temp_max":    int(round(float(t_max))),
+            "temp_min":    int(round(float(t_min))) if t_min is not None else None,
+            "cloud_cover": int(round(float(cloud))) if cloud is not None else None,
+            "source":      "Open-Meteo",
+        }
+    except Exception as e:
+        print(f"  {C['yellow']}OM forecast falhou: {e}{R}")
+        return None
+
+
+def fetch_om_hourly_today(session: requests.Session) -> list[dict]:
+    """
+    Previsão horária de hoje via Open-Meteo.
+    Útil para comparar com observações WU em tempo real.
+    """
+    try:
+        r = session.get(OM_FORECAST, params={
+            "latitude":     MUNICH_LAT_OM,
+            "longitude":    MUNICH_LON_OM,
+            "hourly":       "temperature_2m,cloud_cover,relative_humidity_2m",
+            "timezone":     "Europe/Berlin",
+            "forecast_days": 1,
+        }, timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        hourly = d.get("hourly", {})
+        times  = hourly.get("time", [])
+        temps  = hourly.get("temperature_2m", [])
+        clouds = hourly.get("cloud_cover", [])
+        hums   = hourly.get("relative_humidity_2m", [])
+
+        rows = []
+        for i, t_str in enumerate(times):
+            dt = datetime.fromisoformat(t_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_BERLIN)
+            temp  = temps[i]  if i < len(temps)  else None
+            cloud = clouds[i] if i < len(clouds) else None
+            hum   = hums[i]   if i < len(hums)   else None
+            if temp is None:
+                continue
+            rows.append({
+                "hour":        dt.hour,
+                "minute":      0,
+                "temp_c":      int(round(float(temp))),
+                "humidity":    int(round(float(hum))) if hum is not None else 70,
+                "cloud_cover": int(round(float(cloud))) if cloud is not None else 50,
+                "wx":          "",
+                "source":      "Open-Meteo",
+            })
+        return rows
+    except Exception:
+        return []
+
+
+def fetch_om_latest(session: requests.Session) -> dict | None:
+    """Última previsão horária do Open-Meteo para a hora actual de Munich."""
+    rows = fetch_om_hourly_today(session)
+    if not rows:
+        return None
+    h_now = datetime.now(tz=_BERLIN).hour
+    # Encontrar a observação mais próxima da hora actual
+    closest = min(rows, key=lambda r: abs(r["hour"] - h_now))
+    return closest
+
+
+def bootstrap_om_today(session: requests.Session) -> tuple[dict, list[dict]]:
+    """
+    Bootstrap com dados horários do Open-Meteo.
+    Devolve formato igual ao bootstrap_today() do WU.
+    """
+    today = berlin_date()
+    print(f"  {DIM}Open-Meteo hourly forecast {today}...{R}", end=" ", flush=True)
+    rows = fetch_om_hourly_today(session)
+    if not rows:
+        print(f"{C['red']}sem dados OM{R}")
+        return {}, []
+    t_vals = [r["temp_c"] for r in rows]
+    print(f"{C['green']}{len(rows)} obs  "
+          f"{min(t_vals)}°C – {max(t_vals)}°C{R}")
+
+    series: dict[tuple, float] = {}
+    obs_min: dict[tuple, tuple] = {}
+    for r in rows:
+        key = ceil_slot(r["hour"], r["minute"])
+        if key not in series or r["temp_c"] >= series[key]:
+            series[key]  = r["temp_c"]
+            obs_min[key] = (r["hour"], r["minute"])
+
+    seen: set[tuple] = set()
+    slots: list[dict] = []
+    for r in sorted(rows, key=lambda x: x["hour"] * 60 + x["minute"]):
+        k = ceil_slot(r["hour"], r["minute"])
+        if k not in seen:
+            seen.add(k)
+            slots.append({
+                "hour":        k[0],
+                "slot30":      k[1],
+                "temp_c":      r["temp_c"],
+                "cloud_cover": r.get("cloud_cover", 50),
+                "humidity":    r.get("humidity", 70),
+                "source":      "Open-Meteo",
+            })
+    return series, slots
+
+
+# ══════════════════════════════════════════════════════
+#  ACORDO DUAL — NOVO
+# ══════════════════════════════════════════════════════
+
+def forecasts_agree(wu_forecast: dict | None,
+                    om_forecast: dict | None,
+                    tolerance: int = FORECAST_AGREEMENT_TOLERANCE) -> dict:
+    """
+    Verifica se ambas as fontes concordam na temperatura máxima prevista.
+
+    Retorna:
+      valid:         bool — ambas concordam (dentro da tolerância)
+      wu_max:        int | None
+      om_max:        int | None
+      diff:          int | None — diferença absoluta em °C
+      consensus_max: int | None — média das duas se concordam
+      reason:        str — "agree", "disagree_Nc", "wu_missing", "om_missing", "both_missing"
+    """
+    if wu_forecast is None and om_forecast is None:
+        return {
+            "valid": False, "wu_max": None, "om_max": None,
+            "diff": None, "consensus_max": None, "reason": "both_missing",
+        }
+    if wu_forecast is None:
+        return {
+            "valid": False, "wu_max": None,
+            "om_max": om_forecast.get("temp_max"),
+            "diff": None, "consensus_max": om_forecast.get("temp_max"),
+            "reason": "wu_missing",
+        }
+    if om_forecast is None:
+        return {
+            "valid": False, "wu_max": wu_forecast.get("temp_max"),
+            "om_max": None, "diff": None,
+            "consensus_max": wu_forecast.get("temp_max"),
+            "reason": "om_missing",
+        }
+
+    wu_max = wu_forecast["temp_max"]
+    om_max = om_forecast["temp_max"]
+    diff   = abs(wu_max - om_max)
+
+    return {
+        "valid":         diff <= tolerance,
+        "wu_max":        wu_max,
+        "om_max":        om_max,
+        "diff":          diff,
+        "consensus_max": round((wu_max + om_max) / 2),
+        "reason":        "agree" if diff <= tolerance else f"disagree_{diff}c",
+    }
