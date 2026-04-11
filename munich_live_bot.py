@@ -3,21 +3,24 @@ munich_live_bot.py
 ==================
 Bot de trading ao vivo — Temperatura Maxima Munich — Polymarket V3.
 
-Estratégia:
-  - Ensemble: LightGBM (50%) + XGBoost (30%) + Z-Score Streaming (20%)
-  - Dupla Confirmação: Modelo + Mercado (bracket com MAIOR ask)
-  - Entrada faseada em 3 parcelas de $5:
-      P1: 10h<=hora<12h + Forecast agreement + Mercado confirma + p>=30%
-      P2: Modelo >= 60% + Mercado confirma (highest ask = running max)
-      P3: Modelo >= 80%
+Modos de entrada:
+  --mode phased  → 3 parcelas $5 (P1 manhã invertida, P2 dupla, P3 alta)
+  --mode single  → 1 compra $15 quando p_ensemble >= 75%
+
+Modos de trading:
+  --run paper    → Paper sem perguntar
+  --run real     → Real sem perguntar (confirma cada ordem, a menos que --yes)
+  --yes / -y     → Headless total (sem perguntas nenhuma)
 
 Variaveis de ambiente:
     export WU_API_KEY="..."
     export POLY_PRIVATE_KEY="0x..."
 
 Uso:
-    python munich_live_bot.py
-    python munich_live_bot.py --yes   # headless
+    python munich_live_bot.py                           # pergunta tudo
+    python munich_live_bot.py --run paper --mode phased  # paper faseado
+    python munich_live_bot.py --run paper --mode single  # paper simples
+    python munich_live_bot.py --run real --yes           # real headless
 """
 
 import argparse
@@ -50,7 +53,7 @@ from munich_model import (
     set_seasonal_prior, compute_prev7,
     init_history_max, update_history_max,
 )
-from munich_phased_entry import PhasedEntry
+from munich_phased_entry import PhasedEntry, SingleEntry
 from munich_display import display, log_tick
 from polymarket_clob import (
     ClobClient, TradingMode, OrderBook,
@@ -331,15 +334,22 @@ def _stdin_has_input(timeout=0.0):
 # ══════════════════════════════════════════════════════
 def run(wu_key: str, threshold: float, bankroll: float,
         kelly_frac: float, min_edge: float, interval: int,
-        headless: bool = False):
+        headless: bool = False, mode: str = "phased",
+        force_trading_mode: str = None):
 
     LOG_DIR.mkdir(exist_ok=True)
 
     if not wu_key:
         raise ValueError(f"\n  {C['red']}WU_API_KEY não definida{R}")
 
-    # ── Modo ──────────────────────────────────────────
-    if headless:
+    # ── Modo trading (paper/real) ────────────────────
+    if force_trading_mode == "real":
+        trading_mode = TradingMode.REAL
+        print(f"\n  {C['red']}{B}REAL activado (via --run real){R}\n")
+    elif force_trading_mode == "paper":
+        trading_mode = TradingMode.PAPER
+        print(f"\n  {C['yellow']}{B}PAPER activado (via --run paper){R}\n")
+    elif headless:
         trading_mode = TradingMode.REAL if POLY_PRIVATE_KEY else TradingMode.PAPER
     else:
         trading_mode = ask_trading_mode()
@@ -388,9 +398,16 @@ def run(wu_key: str, threshold: float, bankroll: float,
     history_max = init_history_max()
     update_history_max(history_max, slots_so_far)
 
-    # ── Z-Score + PhasedEntry ─────────────────────────
+    # ── Z-Score + Entry ──────────────────────────────
     zscore = StreamingPeakDetector()
-    phased = PhasedEntry(parcel_size=5.0)
+
+    if mode == "single":
+        entry = SingleEntry(parcel_size=15.0, threshold=0.75)
+    else:
+        entry = PhasedEntry(parcel_size=5.0)
+
+    mode_label = f"PHASED 3×$5" if mode == "phased" else f"SINGLE 1×$15"
+    print(f"  Entry mode: {mode_label}")
 
     # ── Forecasts ─────────────────────────────────────
     wu_forecast = fetch_wu_forecast_max(wu_key, wu_sess)
@@ -413,7 +430,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "humidity":    slot.get("humidity", 70),
             "prev_7d_avg_max": compute_prev7(history_max, today),
         }
-        # ASSINATURA: predict_ensemble(models, slots_so_far, current, month, doy, zscore)
         ens = predict_ensemble(models, slots_so_far[:i+1],
                               current_extra, month, doy, zscore)
         signals[(h, s)] = ens["p_ensemble"]
@@ -478,7 +494,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 temps_by_hour = {}
                 cloud_by_hour = {}
                 signals       = {}
-                phased.reset()
+                entry.reset()
                 zscore.reset()
                 bets = []
                 log_path  = LOG_DIR / f"live_{today}.csv"
@@ -559,7 +575,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 if latest_obs else 70),
                     "prev_7d_avg_max": compute_prev7(history_max, today),
                 }
-                # ASSINATURA CORRECTA: 6 args, sem feat_cols
                 ensemble_result = predict_ensemble(
                     models, slots_so_far, current_extra,
                     month, doy, zscore
@@ -594,8 +609,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 rmax = 0
                 rmax_time_str = "?"
 
-            # ── Phased Entry ──────────────────────────
-            actions = phased.evaluate(
+            # ── Entry evaluate ────────────────────────
+            actions = entry.evaluate(
                 p, h_cur, market, rmax, forecast_agreement
             )
 
@@ -613,7 +628,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 pidx = action["parcel_idx"]
 
                 # Escolher bracket
-                if pidx == 1 and market:
+                if pidx == 1:
                     target_bracket = max(
                         market["brackets"],
                         key=lambda b: b.get("ask") or b.get("price") or 0
@@ -663,7 +678,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     bet_record["order_id"] = result["order_id"]
                     bet_record["status"]   = result["status"]
                     bet = bet_record
-                    phased.mark_bought(pidx, bet_record)
+                    entry.mark_bought(pidx, bet_record)
                     bets.append(bet)
                     bets_path.write_text(
                         json.dumps(bets, indent=2, default=str))
@@ -681,7 +696,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 bet_record["order_id"] = result["order_id"]
                                 bet_record["status"]   = result["status"]
                                 bet = bet_record
-                                phased.mark_bought(pidx, bet_record)
+                                entry.mark_bought(pidx, bet_record)
                                 bets.append(bet)
                                 bets_path.write_text(
                                     json.dumps(bets, indent=2, default=str))
@@ -697,7 +712,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                 # Telegram
                 if bet:
-                    if pidx == 0:
+                    if entry.n_parcels_bought == 1:
                         tg.alert_peak_detected(
                             p_ensemble=p, rmax=rmax,
                             rmax_time=rmax_time_str,
@@ -723,28 +738,28 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 signals_by_hour, p,
                 market, target_bracket, ev, bet,
                 len(series_today), bankroll, eff_thr,
-                phased.n_parcels_bought > 0,
+                entry.n_parcels_bought > 0,
                 trading_mode       = trading_mode,
                 daily_loss         = clob.daily_loss() if clob else 0.0,
                 max_daily_loss     = POLY_MAX_DAILY_LOSS,
                 usdc_balance       = usdc_balance,
                 positions          = clob.positions if clob else None,
                 bet_blocked_reason = bet_blocked_reason,
-                bet_placed         = phased.n_parcels_bought > 0,
+                bet_placed         = entry.n_parcels_bought > 0,
                 forecast_max       = wu_forecast,
                 berlin_now_dt      = berlin_now(),
                 market_date        = market_date,
                 executor           = executor,
                 open_orders        = open_orders,
                 obs_min_today      = obs_min_today,
-                phased             = phased,
+                phased             = entry,
                 forecast_agreement = forecast_agreement,
                 om_forecast        = om_forecast,
                 ensemble_result    = ensemble_result,
             )
 
             log_tick(
-                now, temp_now, p, phased.n_parcels_bought > 0,
+                now, temp_now, p, entry.n_parcels_bought > 0,
                 target_bracket, ev, bet, log_path,
                 trading_mode       = trading_mode,
                 bet_blocked_reason = (bet_blocked_reason
@@ -756,14 +771,14 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 _tg_last_dashboard = time.time()
                 chart = draw_chart_plain(
                     series_today, signals_by_hour,
-                    phased.n_parcels_bought > 0)
+                    entry.n_parcels_bought > 0)
                 tg.dashboard(
                     today=today, p=p, rmax=rmax,
                     rmax_time=rmax_time_str,
                     temp_now=temp_now, forecast_max=wu_forecast,
                     market=market, bracket=target_bracket,
                     ev=ev,
-                    peak_detected=phased.n_parcels_bought > 0,
+                    peak_detected=entry.n_parcels_bought > 0,
                     bet=bets[-1] if bets else None,
                     clob_mode=clob_mode_str,
                     chart=chart, om_forecast=om_forecast,
@@ -817,7 +832,12 @@ def main():
     parser.add_argument("--min-edge",  type=float, default=5.0)
     parser.add_argument("--interval",  type=int,   default=60)
     parser.add_argument("--yes", "-y", action="store_true",
-                        help="Headless")
+                        help="Headless (não perguntar nada)")
+    parser.add_argument("--mode", choices=["phased", "single"],
+                        default="phased",
+                        help="phased=3 parcelas $5, single=1 compra $15")
+    parser.add_argument("--run", choices=["paper", "real"], default=None,
+                        help="Forçar modo paper/real sem perguntar")
     args = parser.parse_args()
 
     run(
@@ -828,6 +848,8 @@ def main():
         min_edge   = args.min_edge,
         interval   = args.interval,
         headless   = args.yes,
+        mode       = args.mode,
+        force_trading_mode = args.run,
     )
 
 
