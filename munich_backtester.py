@@ -1,13 +1,19 @@
 """
 munich_backtester.py
 ====================
-Backtest V3: Ensemble (LGBM + XGB + Z-Score) + 3 Parcelas com Dupla Confirmação.
+Backtest V3: Ensemble (LGBM + XGB + Z-Score) + Phased(3) ou Single(1).
 
-P1: 10h<=hora<12h + Forecast Agreement + Mercado confirma + p>=30%
-P2: p_ensemble >= 60% + Mercado confirma (highest ask = running max)
-P3: p_ensemble >= 80%
+Modos:
+  --mode phased  → 3 parcelas $5 (P1 manhã invertida, P2 dupla, P3 alta)
+  --mode single  → 1 compra $15 quando p_ensemble >= 75%
+
+Uso:
+    python munich_backtester.py
+    python munich_backtester.py --mode phased
+    python munich_backtester.py --mode single
 """
 
+import argparse
 import json
 import warnings
 from pathlib import Path
@@ -26,7 +32,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box as rich_box
 
-from munich_phased_entry import PhasedEntry
+from munich_phased_entry import PhasedEntry, SingleEntry
 
 _console = Console(force_terminal=True)
 warnings.filterwarnings("ignore")
@@ -52,11 +58,15 @@ MONTHS_PT = [
 ]
 
 FEATURE_COLS = [
+    # ── V1 Canónicas (18) ──
     "slot_frac", "doy_sin", "doy_cos", "temp_c", "running_max",
     "temp_vs_climatology", "delta_30m", "delta_1h", "accel",
     "recent_slope", "temp_lag_3", "roll3_std", "plateau_indicator",
     "morning_max", "radiation_proxy", "humidity_drop_1h",
     "prev_7d_avg_max", "seasonal_peak_prior",
+    # ── V2 Preditivas (7) ──
+    "dewpoint_c", "temp_to_dewpoint_gap", "pressure_trend_3h",
+    "wind_south_proxy", "wind_speed_kmh", "uv_index", "foehn_indicator",
 ]
 
 
@@ -199,6 +209,21 @@ def load_data(csv_path=DATA_CSV) -> pd.DataFrame:
     else:
         raw["cloud_cover"] = 50.0
 
+    # ── V2: Colunas preditivas ───────────────────────
+    raw["dewpoint_c"]     = pd.to_numeric(raw.get("dewpt_c"), errors="coerce")
+    raw["pressure_hpa"]   = pd.to_numeric(raw.get("pressure_hpa"), errors="coerce")
+    raw["wind_dir_deg"]   = pd.to_numeric(raw.get("wind_dir_deg"), errors="coerce")
+    raw["wind_speed_kmh"] = pd.to_numeric(raw.get("wind_speed_kmh"), errors="coerce")
+    raw["wind_gust_kmh"]  = pd.to_numeric(raw.get("wind_gust_kmh"), errors="coerce")
+    raw["uv_index"]       = pd.to_numeric(raw.get("uv_index"), errors="coerce")
+
+    raw["dewpoint_c"]     = raw["dewpoint_c"].fillna(raw["temp_c"] - 10)
+    raw["pressure_hpa"]   = raw["pressure_hpa"].fillna(1013.0)
+    raw["wind_dir_deg"]   = raw["wind_dir_deg"].fillna(0.0)
+    raw["wind_speed_kmh"] = raw["wind_speed_kmh"].fillna(5.0)
+    raw["wind_gust_kmh"]  = raw["wind_gust_kmh"].fillna(8.0)
+    raw["uv_index"]       = raw["uv_index"].fillna(3.0)
+
     df = raw[
         (raw["hour"] >= DAY_START) & (raw["hour"] <= DAY_END)
     ].dropna(subset=["temp_c"]).sort_values(
@@ -265,13 +290,13 @@ class ZScoreStreaming:
 
 
 # ══════════════════════════════════════════════════════
-#  SIMULATED MARKET — ruído dependente da hora
+#  SIMULATED MARKET
 # ══════════════════════════════════════════════════════
 class SimulatedMarket:
     """
-    De manhã (antes das 12h): mercado tem MAIS ruído → highest ask
+    De manhã: mercado tem MAIS ruído → highest ask
     NÃO é sempre o running_max → confirmação falha frequentemente.
-    À tarde (depois das 14h): mercado converge → confirmação funciona.
+    À tarde: mercado converge → confirmação funciona.
     """
     def __init__(self, temp_range=range(5, 40)):
         self.temp_range = temp_range
@@ -331,7 +356,7 @@ class SimulatedMarket:
 
 
 # ══════════════════════════════════════════════════════
-#  BUILD SLOT FEATURES
+#  BUILD SLOT FEATURES (V1 + V2)
 # ══════════════════════════════════════════════════════
 def build_slot(slots_so_far, current, month, doy, prior_map):
     vals = [s["temp_c"] for s in slots_so_far]
@@ -341,12 +366,10 @@ def build_slot(slots_so_far, current, month, doy, prior_map):
     hour = current["hour"]
     slot30 = current["slot30"]
     cloud  = float(current.get("cloud_cover", 50))
+    hu     = float(current.get("humidity", 70))
 
-    def lag(k):
-        return vals[-k] if n >= k else vals[0]
-
-    def lagh(k):
-        return hums[-k] if n >= k else hums[0]
+    def lag(k):  return vals[-k] if n >= k else vals[0]
+    def lagh(k): return hums[-k] if n >= k else hums[0]
 
     rmax = max(vals)
 
@@ -374,7 +397,34 @@ def build_slot(slots_so_far, current, month, doy, prior_map):
 
     prev7 = current["prev_7d_avg_max"]
 
+    # ── V2: Features preditivas ───────────────────────
+    dewpt = current.get("dewpoint_c", cur - 10)
+    pres  = current.get("pressure_hpa", 1013)
+    wdir  = current.get("wind_dir_deg", 0)
+    wspd  = current.get("wind_speed_kmh", 5)
+    wgst  = current.get("wind_gust_kmh", 8)
+    uv    = current.get("uv_index", 3)
+
+    temp_to_dewpoint_gap = max(0.0, cur - dewpt)
+
+    press_vals = [s.get("pressure_hpa", 1013) for s in slots_so_far[-6:]]
+    if len(press_vals) >= 2:
+        pressure_trend_3h = press_vals[-1] - press_vals[0]
+    else:
+        pressure_trend_3h = 0.0
+
+    if 135 <= wdir <= 225:
+        wind_south_proxy = 1.0 - abs(wdir - 180) / 45.0
+    else:
+        wind_south_proxy = 0.0
+
+    foehn_south = 1.0 if 135 <= wdir <= 225 else 0.0
+    foehn_gusty = min(1.0, wgst / 30.0)
+    foehn_dry   = max(0.0, (80 - hu) / 20.0) if hu < 80 else 0.0
+    foehn_indicator = foehn_south * (0.4 + 0.3 * foehn_gusty + 0.3 * foehn_dry)
+
     return {
+        # ── V1 (18) ──
         "slot_frac":           slot_frac,
         "doy_sin":             float(np.sin(2 * np.pi * doy / 365)),
         "doy_cos":             float(np.cos(2 * np.pi * doy / 365)),
@@ -393,11 +443,19 @@ def build_slot(slots_so_far, current, month, doy, prior_map):
         "humidity_drop_1h":    hum_drop,
         "prev_7d_avg_max":     prev7,
         "seasonal_peak_prior": prior,
+        # ── V2 (7) ──
+        "dewpoint_c":          dewpt,
+        "temp_to_dewpoint_gap": temp_to_dewpoint_gap,
+        "pressure_trend_3h":   pressure_trend_3h,
+        "wind_south_proxy":    wind_south_proxy,
+        "wind_speed_kmh":      wspd,
+        "uv_index":            uv,
+        "foehn_indicator":     foehn_indicator,
     }
 
 
 # ══════════════════════════════════════════════════════
-#  PREDICT ENSEMBLE — usa predict_proba() !!!
+#  PREDICT ENSEMBLE
 # ══════════════════════════════════════════════════════
 def predict_ensemble(models, slots_so_far, current,
                      month, doy, zscore_det):
@@ -410,7 +468,6 @@ def predict_ensemble(models, slots_so_far, current,
     avail = [f for f in feat_cols if f in feat]
     X     = pd.DataFrame([feat])[avail].fillna(0)
 
-    # predict_proba() NÃO predict() !!!
     p_lgbm = float(models["model_lgb"].predict_proba(X)[0, 1])
 
     p_xgb = None
@@ -435,7 +492,7 @@ def predict_ensemble(models, slots_so_far, current,
 # ══════════════════════════════════════════════════════
 #  RUN BACKTEST
 # ══════════════════════════════════════════════════════
-def run(df, models, sim_market, parcel_size=5.0):
+def run(df, models, sim_market, mode="phased", parcel_size=5.0):
     feat_cols         = models["feat_cols"]
     prior_map         = models["prior_map"]
     monthly_threshold = models["monthly_threshold"]
@@ -481,7 +538,10 @@ def run(df, models, sim_market, parcel_size=5.0):
             zscore = ZScoreStreaming()
             zscore.reset()
 
-            phased = PhasedEntry(parcel_size=parcel_size)
+            if mode == "single":
+                entry = SingleEntry(parcel_size=parcel_size * 3)
+            else:
+                entry = PhasedEntry(parcel_size=parcel_size)
 
             forecast_agrees = np.random.random() < 0.80
 
@@ -495,6 +555,12 @@ def run(df, models, sim_market, parcel_size=5.0):
                 slot_entry = {
                     "hour": h, "slot30": s, "temp_c": t,
                     "cloud_cover": cl, "humidity": hu,
+                    "dewpoint_c":    float(row.get("dewpoint_c", t - 10)),
+                    "pressure_hpa":  float(row.get("pressure_hpa", 1013)),
+                    "wind_dir_deg":  float(row.get("wind_dir_deg", 0)),
+                    "wind_speed_kmh":float(row.get("wind_speed_kmh", 5)),
+                    "wind_gust_kmh": float(row.get("wind_gust_kmh", 8)),
+                    "uv_index":      float(row.get("uv_index", 3)),
                 }
                 slots_so_far.append(slot_entry)
 
@@ -511,9 +577,14 @@ def run(df, models, sim_market, parcel_size=5.0):
                     "cloud_cover": cl, "humidity": hu,
                     "prev_7d_avg_max": prev7.get(d, peak_temp),
                     "temp_c": t,
+                    "dewpoint_c":    float(row.get("dewpoint_c", t - 10)),
+                    "pressure_hpa":  float(row.get("pressure_hpa", 1013)),
+                    "wind_dir_deg":  float(row.get("wind_dir_deg", 0)),
+                    "wind_speed_kmh":float(row.get("wind_speed_kmh", 5)),
+                    "wind_gust_kmh": float(row.get("wind_gust_kmh", 8)),
+                    "uv_index":      float(row.get("uv_index", 3)),
                 }
 
-                # predict_ensemble(models, slots, current, month, doy, zscore)
                 p_ens, p_lgbm, p_xgb, p_zs = predict_ensemble(
                     models, slots_so_far, current_extra,
                     month, doy, zscore
@@ -535,7 +606,7 @@ def run(df, models, sim_market, parcel_size=5.0):
                 fc_agreement = {"valid": forecast_agrees}
 
                 # ── Avaliar parcelas ──────────────────
-                actions = phased.evaluate(
+                actions = entry.evaluate(
                     p_ens, h, market_sim, running_max, fc_agreement)
 
                 for act in actions:
@@ -551,10 +622,10 @@ def run(df, models, sim_market, parcel_size=5.0):
                                  if b["temp_lo"] <= rmax_int <= b["temp_hi"]),
                                 max(brackets, key=lambda b: b["ask"]))
 
-                        phased.mark_bought(pidx, {
+                        entry.mark_bought(pidx, {
                             "hour": h, "slot30": s,
                             "ask": best["ask"],
-                            "size_usdc": parcel_size,
+                            "size_usdc": act["size_usdc"],
                             "bracket_label": best["label"],
                         })
 
@@ -566,23 +637,23 @@ def run(df, models, sim_market, parcel_size=5.0):
 
             parcel_lags = []
             for i in range(3):
-                if (phased.parcel_bought[i]
-                        and phased.parcel_records[i] is not None):
+                if (entry.parcel_bought[i]
+                        and entry.parcel_records[i] is not None):
                     lag = (slot_idx(
-                               phased.parcel_records[i]["hour"],
-                               phased.parcel_records[i]["slot30"])
+                               entry.parcel_records[i]["hour"],
+                               entry.parcel_records[i]["slot30"])
                            - peak_idx_val)
                     parcel_lags.append(lag)
                 else:
                     parcel_lags.append(None)
 
-            detected = any(phased.parcel_bought)
+            detected = any(entry.parcel_bought)
 
             first_slot = next(
-                (phased.parcel_records[i]
+                (entry.parcel_records[i]
                  for i in range(3)
-                 if phased.parcel_bought[i]
-                 and phased.parcel_records[i] is not None),
+                 if entry.parcel_bought[i]
+                 and entry.parcel_records[i] is not None),
                 None)
 
             lag_first = None
@@ -608,10 +679,10 @@ def run(df, models, sim_market, parcel_size=5.0):
                 "peak_temp":       round(peak_temp, 2),
                 "peak_h_true":     peak_slot[0],
                 "detected":        detected,
-                "n_parcels":       sum(phased.parcel_bought),
-                "parcel1_bought":  phased.parcel_bought[0],
-                "parcel2_bought":  phased.parcel_bought[1],
-                "parcel3_bought":  phased.parcel_bought[2],
+                "n_parcels":       entry.n_parcels_bought,
+                "parcel1_bought":  entry.parcel_bought[0],
+                "parcel2_bought":  entry.parcel_bought[1],
+                "parcel3_bought":  entry.parcel_bought[2],
                 "parcel1_lag":     parcel_lags[0],
                 "parcel2_lag":     parcel_lags[1],
                 "parcel3_lag":     parcel_lags[2],
@@ -621,7 +692,7 @@ def run(df, models, sim_market, parcel_size=5.0):
                                     and len(premature_lags) == 0),
                 "premature":       len(premature_lags) > 0,
                 "missed":          not detected,
-                "total_invested":  phased.total_invested,
+                "total_invested":  entry.total_invested,
             })
 
     return pd.DataFrame(results), pd.DataFrame(slots_out)
@@ -677,7 +748,7 @@ def compute_metrics(results):
 # ══════════════════════════════════════════════════════
 #  PLOTS
 # ══════════════════════════════════════════════════════
-def plot(results, slots_df, metrics, start_year):
+def plot(results, slots_df, metrics, start_year, mode="phased"):
     print("  A gerar gráficos...")
 
     BG, PANEL = "#07090D", "#0D1018"
@@ -706,7 +777,7 @@ def plot(results, slots_df, metrics, start_year):
 
     # 1. Detecção por mês
     ax1 = fig.add_subplot(gs[0, :2])
-    ax1.set_title("Resultado por Mês — Ensemble 3 Parcelas")
+    ax1.set_title("Resultado por Mês")
     corr_m = results.groupby("month")["correct"].mean() * 100
     prem_m = results.groupby("month")["premature"].mean() * 100
     miss_m = results.groupby("month")["missed"].mean() * 100
@@ -732,20 +803,26 @@ def plot(results, slots_df, metrics, start_year):
 
     # 2. Parcelas por mês
     ax2 = fig.add_subplot(gs[0, 2])
-    ax2.set_title("Parcelas Compradas por Mês")
-    p1 = results.groupby("month")["parcel1_bought"].mean() * 100
-    p2 = results.groupby("month")["parcel2_bought"].mean() * 100
-    p3 = results.groupby("month")["parcel3_bought"].mean() * 100
-    ax2.bar(x, p1.reindex(months_range, fill_value=0), 0.6,
-            color=C["blue"], alpha=0.8, label="P1 Manhã")
-    ax2.bar(x, p2.reindex(months_range, fill_value=0), 0.6,
-            color=C["purple"], alpha=0.8, label="P2 Pico~",
-            bottom=p1.reindex(months_range, fill_value=0))
-    bot3 = (p1.reindex(months_range, fill_value=0)
-            + p2.reindex(months_range, fill_value=0))
-    ax2.bar(x, p3.reindex(months_range, fill_value=0), 0.6,
-            color=C["correct"], alpha=0.8, label="P3 Confirmado",
-            bottom=bot3)
+    if mode == "phased":
+        ax2.set_title("Parcelas Compradas por Mês")
+        p1 = results.groupby("month")["parcel1_bought"].mean() * 100
+        p2 = results.groupby("month")["parcel2_bought"].mean() * 100
+        p3 = results.groupby("month")["parcel3_bought"].mean() * 100
+        ax2.bar(x, p1.reindex(months_range, fill_value=0), 0.6,
+                color=C["blue"], alpha=0.8, label="P1 Manhã")
+        ax2.bar(x, p2.reindex(months_range, fill_value=0), 0.6,
+                color=C["purple"], alpha=0.8, label="P2 Pico~",
+                bottom=p1.reindex(months_range, fill_value=0))
+        bot3 = (p1.reindex(months_range, fill_value=0)
+                + p2.reindex(months_range, fill_value=0))
+        ax2.bar(x, p3.reindex(months_range, fill_value=0), 0.6,
+                color=C["correct"], alpha=0.8, label="P3 Confirmado",
+                bottom=bot3)
+    else:
+        ax2.set_title("Single Buy por Mês")
+        p1 = results.groupby("month")["parcel1_bought"].mean() * 100
+        ax2.bar(x, p1.reindex(months_range, fill_value=0), 0.6,
+                color=C["blue"], alpha=0.8, label="Single")
     ax2.set_xticks(x)
     ax2.set_xticklabels(m_lbls, fontsize=7)
     ax2.set_ylabel("% dias")
@@ -754,7 +831,7 @@ def plot(results, slots_df, metrics, start_year):
 
     # 3. Distribuição do lag
     ax3 = fig.add_subplot(gs[1, 0])
-    ax3.set_title("Distribuição do Lag (1ª parcela, correctos)")
+    ax3.set_title("Distribuição do Lag (1ª compra, correctos)")
     correct_lags = results[results["correct"]]["lag_first_h"].dropna().values
     if len(correct_lags):
         vmin, vmax = correct_lags.min(), correct_lags.max()
@@ -773,41 +850,59 @@ def plot(results, slots_df, metrics, start_year):
 
     # 4. Lag por parcela
     ax4 = fig.add_subplot(gs[1, 1])
-    ax4.set_title("Lag Médio por Parcela (correctos)")
-    parcel_lag_means = []
-    parcel_lag_stds  = []
-    parcel_labels    = []
-    for pidx, pname in [(0, "P1 Manhã"), (1, "P2 Pico~"),
-                        (2, "P3 Confirmado")]:
-        col = f"parcel{pidx + 1}_lag"
+    if mode == "phased":
+        ax4.set_title("Lag Médio por Parcela (correctos)")
+        parcel_lag_means = []
+        parcel_lag_stds  = []
+        parcel_labels    = []
+        for pidx, pname in [(0, "P1 Manhã"), (1, "P2 Pico~"),
+                            (2, "P3 Confirmado")]:
+            col = f"parcel{pidx + 1}_lag"
+            vals = results[results["correct"]][col].dropna().values * 0.5
+            if len(vals):
+                parcel_lag_means.append(np.mean(vals))
+                parcel_lag_stds.append(np.std(vals))
+                parcel_labels.append(pname)
+            else:
+                parcel_lag_means.append(0)
+                parcel_lag_stds.append(0)
+                parcel_labels.append(pname)
+
+        colors_p = [C["blue"], C["purple"], C["correct"]]
+        ax4.bar(parcel_labels, parcel_lag_means, yerr=parcel_lag_stds,
+                color=colors_p, alpha=0.85,
+                error_kw={"color": C["muted"], "capsize": 3})
+        ax4.axhline(0, color=C["muted"], lw=0.8)
+        ax4.set_ylabel("Lag (h)")
+    else:
+        ax4.set_title("Lag Single Buy (correctos)")
+        col = "parcel1_lag"
         vals = results[results["correct"]][col].dropna().values * 0.5
         if len(vals):
-            parcel_lag_means.append(np.mean(vals))
-            parcel_lag_stds.append(np.std(vals))
-            parcel_labels.append(pname)
-        else:
-            parcel_lag_means.append(0)
-            parcel_lag_stds.append(0)
-            parcel_labels.append(pname)
-
-    colors_p = [C["blue"], C["purple"], C["correct"]]
-    ax4.bar(parcel_labels, parcel_lag_means, yerr=parcel_lag_stds,
-            color=colors_p, alpha=0.85,
-            error_kw={"color": C["muted"], "capsize": 3})
-    ax4.axhline(0, color=C["muted"], lw=0.8)
-    ax4.set_ylabel("Lag (h)")
+            ax4.bar(["Single"], [np.mean(vals)],
+                    yerr=[np.std(vals)],
+                    color=C["blue"], alpha=0.85,
+                    error_kw={"color": C["muted"], "capsize": 3})
+        ax4.axhline(0, color=C["muted"], lw=0.8)
+        ax4.set_ylabel("Lag (h)")
     ax4.grid(True, alpha=0.3, axis="y")
 
     # 5. Nº parcelas por dia
     ax5 = fig.add_subplot(gs[1, 2])
-    ax5.set_title("Distribuição: Nº Parcelas/Dia")
+    ax5.set_title("Distribuição: Compras/Dia")
     n_par = results["n_parcels"].values
-    for v in [0, 1, 2, 3]:
-        cnt = (n_par == v).sum()
-        col = (C["missed"] if v == 0 else C["premature"] if v == 1
-               else C["purple"] if v == 2 else C["correct"])
-        ax5.bar(str(v), cnt, color=col, alpha=0.85)
-    ax5.set_xlabel("Parcelas compradas")
+    if mode == "phased":
+        for v in [0, 1, 2, 3]:
+            cnt = (n_par == v).sum()
+            col = (C["missed"] if v == 0 else C["premature"] if v == 1
+                   else C["purple"] if v == 2 else C["correct"])
+            ax5.bar(str(v), cnt, color=col, alpha=0.85)
+    else:
+        for v, lbl in [(0, "0"), (1, "1")]:
+            cnt = (n_par == v).sum()
+            col = C["missed"] if v == 0 else C["correct"]
+            ax5.bar(lbl, cnt, color=col, alpha=0.85)
+    ax5.set_xlabel("Compras")
     ax5.set_ylabel("Dias")
     ax5.grid(True, alpha=0.3, axis="y")
 
@@ -873,7 +968,9 @@ def plot(results, slots_df, metrics, start_year):
     # 9. Resumo
     ax9 = fig.add_subplot(gs[3, 2])
     ax9.axis("off")
+    mode_tag = "PHASED 3×$5" if mode == "phased" else "SINGLE 1×$15"
     summary_lines = [
+        f"Modo: {mode_tag}",
         f"Dias: {metrics['n_days']}",
         f"Correcto: {metrics['correct_pct']}%",
         f"Prematuro: {metrics['premature_pct']}%",
@@ -884,10 +981,19 @@ def plot(results, slots_df, metrics, start_year):
         f"Lag ≤ 1h: {metrics.get('lag_le1h_pct', 0)}%",
         f"Lag ≤ 2h: {metrics.get('lag_le2h_pct', 0)}%",
         "",
-        f"P1 Manhã: {metrics['parcel1_pct']}% dias",
-        f"P2 Pico~: {metrics['parcel2_pct']}% dias",
-        f"P3 Confirmado: {metrics['parcel3_pct']}% dias",
-        f"Média parcelas/dia: {metrics['avg_n_parcels']}",
+    ]
+    if mode == "phased":
+        summary_lines += [
+            f"P1 Manhã: {metrics['parcel1_pct']}% dias",
+            f"P2 Pico~: {metrics['parcel2_pct']}% dias",
+            f"P3 Confirmado: {metrics['parcel3_pct']}% dias",
+            f"Média parcelas/dia: {metrics['avg_n_parcels']}",
+        ]
+    else:
+        summary_lines += [
+            f"Single Buy: {metrics['parcel1_pct']}% dias",
+        ]
+    summary_lines += [
         f"Invest. médio: ${metrics['avg_invested']:.2f}/dia",
     ]
     ax9.text(0.1, 0.95, "\n".join(summary_lines),
@@ -900,13 +1006,14 @@ def plot(results, slots_df, metrics, start_year):
     lag_str = (f"+{metrics['lag_mean_h']}h"
                if metrics.get('lag_mean_h') else "N/A")
     fig.suptitle(
-        f"Munich Max Temp — Backtest Ensemble 3 Parcelas  "
+        f"Munich Max Temp — {mode_tag}  "
         f"correcto={metrics['correct_pct']}%  lag={lag_str}  "
         f"invest=${metrics['avg_invested']:.1f}/dia",
         fontsize=13)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    out_path = OUTPUT_DIR / f"munich_backtest_ensemble_{start_year}.png"
+    mode_slug = "phased" if mode == "phased" else "single"
+    out_path = OUTPUT_DIR / f"munich_backtest_{mode_slug}_{start_year}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Dashboard guardado: {out_path}")
@@ -917,11 +1024,18 @@ def plot(results, slots_df, metrics, start_year):
 #  MAIN
 # ══════════════════════════════════════════════════════
 def main():
-    start_str  = input("Data de início (YYYY-MM-DD): ").strip()
+    parser = argparse.ArgumentParser(description="Munich Backtest V3")
+    parser.add_argument("--mode", choices=["phased", "single"],
+                        default="phased",
+                        help="phased=3 parcelas $5, single=1 compra $15")
+    args = parser.parse_args()
+
+    start_str = input("Data de início (YYYY-MM-DD): ").strip()
     start_date = pd.to_datetime(start_str).date()
     end_date   = date.today() - timedelta(days=1)
 
-    print(f"\n  Backtest V3: {start_date} → {end_date}")
+    mode_label = "PHASED 3×$5" if args.mode == "phased" else "SINGLE 1×$15"
+    print(f"\n  Backtest V3: {start_date} → {end_date}  [{mode_label}]")
 
     print("\n[1/5] Modelos...")
     models = load_models()
@@ -935,16 +1049,19 @@ def main():
     ].copy()
     print(f"  {len(df):,} slots no intervalo")
 
-    print("\n[3/5] Backtest...")
+    print(f"\n[3/5] Backtest ({mode_label})...")
     sim_market = SimulatedMarket()
-    results, slots_df = run(df, models, sim_market, parcel_size=5.0)
+    results, slots_df = run(df, models, sim_market,
+                            mode=args.mode, parcel_size=5.0)
 
     print("\n[4/5] Métricas...")
     metrics = compute_metrics(results)
 
     # ── Rich Tables ────────────────────────────────────
     _console.print()
-    _console.rule("[bold cyan]Resultados V3[/bold cyan]")
+    mode_header = "Resultados V3 — PHASED" if args.mode == "phased" \
+                  else "Resultados V3 — SINGLE"
+    _console.rule(f"[bold cyan]{mode_header}[/bold cyan]")
 
     t = Table(box=rich_box.SIMPLE, show_header=False, padding=(0, 2))
     t.add_column("Label", style="dim", width=26)
@@ -963,12 +1080,17 @@ def main():
               f"{metrics.get('lag_le1h_pct', 0)}%")
     t.add_row("Lag ≤ 2h",
               f"{metrics.get('lag_le2h_pct', 0)}%")
-    t.add_row("P1 Manhã (10h–12h)",
-              f"{metrics['parcel1_pct']}% dias")
-    t.add_row("P2 Modelo+Mercado",
-              f"{metrics['parcel2_pct']}% dias")
-    t.add_row("P3 Alta confiança",
-              f"{metrics['parcel3_pct']}% dias")
+
+    if args.mode == "phased":
+        t.add_row("P1 Manhã (10h–12h)",
+                  f"{metrics['parcel1_pct']}% dias")
+        t.add_row("P2 Modelo+Mercado",
+                  f"{metrics['parcel2_pct']}% dias")
+        t.add_row("P3 Alta confiança",
+                  f"{metrics['parcel3_pct']}% dias")
+    else:
+        t.add_row("Single Buy (p≥75%)",
+                  f"{metrics['parcel1_pct']}% dias")
     t.add_row("Invest. médio/dia",
               f"${metrics['avg_invested']:.2f}")
     _console.print(t)
@@ -1000,8 +1122,8 @@ def main():
                 lag_v)
     _console.print(t_s)
 
-    print("\n[5/5] Dashboard...")
-    plot(results, slots_df, metrics, start_date.year)
+    print(f"\n[5/5] Dashboard...")
+    plot(results, slots_df, metrics, start_date.year, mode=args.mode)
 
 
 if __name__ == "__main__":
