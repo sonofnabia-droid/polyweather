@@ -240,8 +240,8 @@
   },
   "lgbm_feature_importance_pct": {
     "seasonal_peak_prior": 8.19,
-    "doy_sin": 13.38,
-    "doy_cos": 12.2,
+    "doy_sin": 13.41,
+    "doy_cos": 12.17,
     "prev_7d_avg_max": 12.05,
     "temp_vs_climatology": 11.71,
     "slot_frac": 4.39,
@@ -280,8 +280,8 @@
   },
   "ensemble_feature_importance_pct": {
     "seasonal_peak_prior": 30.48,
-    "doy_sin": 8.62,
-    "doy_cos": 7.95,
+    "doy_sin": 8.64,
+    "doy_cos": 7.93,
     "prev_7d_avg_max": 7.78,
     "temp_vs_climatology": 7.59,
     "slot_frac": 6.68,
