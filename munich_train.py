@@ -33,6 +33,11 @@ from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score, f1_score
 
+# ══════════════════════════════════════════════════════
+#  CORES ANSI (para compatibilidade com munich_config)
+# ══════════════════════════════════════════════════════
+R   = "\033[0m"
+DIM = "\033[2m"
 warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════
