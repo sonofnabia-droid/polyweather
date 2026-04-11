@@ -1,34 +1,38 @@
 """
 munich_phased_entry.py
 ======================
-Lógica de entrada faseada em 3 parcelas de $5.
+Lógica de entrada: modo PHASED (3 parcelas) ou SINGLE (1 compra).
 
-P1: Regra TRIPLA — manhã + forecast + mercado confirma
-    • 10h <= hora < 12h (hora de Munich)
-    • forecasts_agree() = True (WU e Open-Meteo concordam)
-    • Mercado confirma: bracket com MAIOR ask = running max
-    • p_ensemble >= 30% (confiança mínima do modelo)
+PHASED:
+  P1: Regra TRIPLA — manhã + forecast + mercado confirma
+      • 10h <= hora < 12h
+      • forecasts_agree() = True
+      • Mercado confirma: bracket com MAIOR ask = running max
+      • p_ensemble <= 70% (pico ainda NÃO ocorreu → comprar ANTES)
 
-P2: Dupla confirmação — modelo + mercado
-    • p_ensemble >= 60%
-    • Mercado confirma: bracket com MAIOR ask = running max
+  P2: Dupla confirmação — modelo + mercado
+      • p_ensemble >= 60%
+      • Mercado confirma
 
-P3: Alta confiança
-    • p_ensemble >= 80%
+  P3: Alta confiança
+      • p_ensemble >= 80%
+
+SINGLE:
+  • Compra única quando p_ensemble >= 75%
+  • Sem janela horária, sem forecast, sem confirmação de mercado
 """
 
 
 class PhasedEntry:
     def __init__(self, parcel_size: float = 5.0):
         self.parcel_size = parcel_size
-        self.thr_p1 = 0.30
+        self.thr_p1_max = 0.70   # P1: limite SUPERIOR (pico ainda não ocorreu)
         self.thr_p2 = 0.60
         self.thr_p3 = 0.80
         self.temp_tolerance = 1
 
-        # Janela matinal de P1 (hora de Munich)
         self.p1_hour_min = 10
-        self.p1_hour_max = 12  # exclusive
+        self.p1_hour_max = 12
 
         self.parcel_bought  = [False, False, False]
         self.parcel_records = [None, None, None]
@@ -65,20 +69,21 @@ class PhasedEntry:
     def evaluate(self, p_ensemble, hour, market, running_max, forecast_agreement):
         actions = []
 
-        # ── PARCELA 1: Regra TRIPLA ──────────────────
+        # ── PARCELA 1: ANTES do pico (lógica invertida) ─
         if not self.parcel_bought[0]:
             in_morning = self.p1_hour_min <= hour < self.p1_hour_max
             fc_ok = (forecast_agreement is not None
                      and forecast_agreement.get("valid", False))
             mkt_ok, mkt_detail = self._market_confirms_model(market, running_max)
-            model_ok = p_ensemble >= self.thr_p1
+            model_ok = p_ensemble <= self.thr_p1_max
 
             if in_morning and fc_ok and mkt_ok and model_ok:
                 actions.append({
                     "parcel_idx": 0,
                     "size_usdc":  self.parcel_size,
                     "reason":     (f"P1: manhã ({hour}h) + fc agree + "
-                                   f"{mkt_detail} + p={p_ensemble*100:.0f}%"),
+                                   f"{mkt_detail} + p={p_ensemble*100:.0f}% "
+                                   f"(antes do pico)"),
                     "model_ok":   True,
                     "market_ok":  True,
                 })
@@ -93,7 +98,8 @@ class PhasedEntry:
                     reasons.append(f"mercado NÃO ({mkt_detail})")
                 if not model_ok:
                     reasons.append(
-                        f"p={p_ensemble*100:.0f}% < {self.thr_p1*100:.0f}%")
+                        f"p={p_ensemble*100:.0f}% > {self.thr_p1_max*100:.0f}% "
+                        f"(pico já passou!)")
                 actions.append({
                     "parcel_idx": 0,
                     "size_usdc":  0,
@@ -154,3 +160,67 @@ class PhasedEntry:
     @property
     def n_parcels_bought(self):
         return sum(self.parcel_bought)
+
+
+# ══════════════════════════════════════════════════════
+#  SINGLE ENTRY — 1 compra quando p >= threshold
+# ══════════════════════════════════════════════════════
+class SingleEntry:
+    """
+    Modo SINGLE: compra única quando p_ensemble >= threshold.
+    Interface compatível com PhasedEntry (parcel_bought, parcel_records, etc.)
+    """
+
+    def __init__(self, parcel_size: float = 15.0, threshold: float = 0.75):
+        self.parcel_size = parcel_size
+        self.threshold   = threshold
+        self.bought      = False
+        self.record      = None
+
+    def evaluate(self, p_ensemble, hour, market, running_max, forecast_agreement):
+        actions = []
+
+        if not self.bought and p_ensemble >= self.threshold:
+            actions.append({
+                "parcel_idx": 0,
+                "size_usdc":  self.parcel_size,
+                "reason":     (f"SINGLE: p={p_ensemble*100:.0f}% >= "
+                               f"{self.threshold*100:.0f}%"),
+                "model_ok":   True,
+                "market_ok":  True,
+            })
+        elif not self.bought:
+            actions.append({
+                "parcel_idx": 0,
+                "size_usdc":  0,
+                "reason":     (f"SINGLE: p={p_ensemble*100:.0f}% < "
+                               f"{self.threshold*100:.0f}%"),
+                "model_ok":   False,
+                "market_ok":  None,
+            })
+
+        return actions
+
+    def mark_bought(self, parcel_idx, record):
+        self.bought = True
+        self.record = record
+
+    def reset(self):
+        self.bought = False
+        self.record = None
+
+    @property
+    def total_invested(self):
+        return self.parcel_size if self.bought else 0.0
+
+    @property
+    def n_parcels_bought(self):
+        return 1 if self.bought else 0
+
+    @property
+    def parcel_bought(self):
+        return [self.bought, False, False]
+
+    @property
+    def parcel_records(self):
+        return [self.record, None, None]
