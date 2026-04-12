@@ -193,20 +193,28 @@ class OrderExecutor:
         Devolve dict com success, order_id, status, error.
 
         order_type="FOK" (default): Fill-or-Kill ao ask.
-            shares = floor(size/price) → makerAmount sempre com ≤ 2 casas decimais.
+            makerAmount (USDC) é truncado a 2 casas decimais — requisito da API.
+            shares (takerAmount) ficam com 4 casas decimais (máx permitido: 5).
             Preenche imediatamente ou cancela — comportamento de market order.
+
         order_type="GTC": Good-Till-Cancelled.
             shares = round(size/price, 4) → fica no book se não encher.
         """
         from py_clob_client.clob_types import OrderArgs, OrderType
 
+        # ── FIX: garantir makerAmount com máx 2 casas decimais ──────────
+        # A API rejeita ordens onde o USDC gasto (makerAmount) tenha > 2 decimais.
+        # Solução: truncar size_usdc a 2 casas ANTES de calcular shares,
+        # assim makerAmount efectivo = size_usdc_clean (exactamente 2 decimais).
         if order_type.upper() == "FOK":
-            # floor garante shares inteiro → shares×price nunca excede 2 casas decimais
-            shares = math.floor(size_usdc / price)
-            _otype = OrderType.FOK
+            size_usdc_clean = math.floor(size_usdc * 100) / 100   # ex: 20.156 → 20.15
+            shares          = round(size_usdc_clean / price, 4)    # takerAmount, máx 5 dec
+            _otype          = OrderType.FOK
         else:
-            shares = round(size_usdc / price, 4)
-            _otype = OrderType.GTC
+            size_usdc_clean = size_usdc
+            shares          = round(size_usdc / price, 4)
+            _otype          = OrderType.GTC
+        # ────────────────────────────────────────────────────────────────
 
         try:
             order_args = OrderArgs(
@@ -232,7 +240,7 @@ class OrderExecutor:
                 "side":       "BUY",
                 "token_id":   token_id,
                 "price":      round(price, 4),
-                "size_usdc":  round(size_usdc, 2),
+                "size_usdc":  round(size_usdc_clean, 2),
                 "shares":     shares,
                 "label":      label,
                 "error":      None if success else f"status={status} response={response}",
@@ -250,7 +258,7 @@ class OrderExecutor:
                 "side":       "BUY",
                 "token_id":   token_id,
                 "price":      round(price, 4),
-                "size_usdc":  round(size_usdc, 2),
+                "size_usdc":  round(size_usdc_clean, 2),
                 "shares":     shares,
                 "label":      label,
                 "error":      str(e),
