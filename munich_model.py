@@ -171,7 +171,38 @@ def build_features(slots_so_far: list[dict], current: dict,
     # humidity_drop_1h
     hum_drop_1h = lagh(3) - hums[-1] if n >= 3 else 0.0
 
+    # ── Features V2 (defaults para dados faltantes) ───────────────
+    dewpt = float(current.get("dewpoint_c", cur - 10))
+    pres  = float(current.get("pressure_hpa", 1013.0))
+    wdir  = float(current.get("wind_dir_deg", 0.0))
+    wspd  = float(current.get("wind_speed_kmh", 5.0))
+    wgst  = float(current.get("wind_gust_kmh", 8.0))
+    uv    = float(current.get("uv_index", 3.0))
+
+    temp_to_dewpoint_gap = max(0.0, cur - dewpt)
+
+    # Pressure trend: últimas 3h (6 slots)
+    press_vals = [s.get("pressure_hpa", 1013.0) for s in slots_so_far[-6:]]
+    if len(press_vals) >= 2:
+        pressure_trend_3h = press_vals[-1] - press_vals[0]
+    else:
+        pressure_trend_3h = 0.0
+
+    # Wind south proxy: alinhamento com 180° (Sul)
+    if 135 <= wdir <= 225:
+        wind_south_proxy = 1.0 - abs(wdir - 180) / 45.0
+    else:
+        wind_south_proxy = 0.0
+
+    # Foehn: vento sul + rajadas + seco
+    hu = hums[-1] if hums else 70
+    foehn_south = 1.0 if 135 <= wdir <= 225 else 0.0
+    foehn_gusty = min(1.0, wgst / 30.0)
+    foehn_dry   = max(0.0, (80 - hu) / 20.0) if hu < 80 else 0.0
+    foehn_indicator = foehn_south * (0.4 + 0.3 * foehn_gusty + 0.3 * foehn_dry)
+
     return {
+        # ── V1 (18) ──
         "slot_frac":           slot_frac,
         "doy_sin":             float(np.sin(2 * np.pi * doy / 365)),
         "doy_cos":             float(np.cos(2 * np.pi * doy / 365)),
@@ -190,6 +221,14 @@ def build_features(slots_so_far: list[dict], current: dict,
         "humidity_drop_1h":    hum_drop_1h,
         "prev_7d_avg_max":     prev7,
         "seasonal_peak_prior": get_seasonal_prior(month, hour, slot30),
+        # ── V2 (7) ──
+        "dewpoint_c":          dewpt,
+        "temp_to_dewpoint_gap": temp_to_dewpoint_gap,
+        "pressure_trend_3h":   pressure_trend_3h,
+        "wind_south_proxy":    wind_south_proxy,
+        "wind_speed_kmh":      wspd,
+        "uv_index":            uv,
+        "foehn_indicator":     foehn_indicator,
     }
 
 
