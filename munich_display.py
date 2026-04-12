@@ -307,31 +307,52 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
 
     # ── Parcelas ──────────────────────────────────────
     if phased is not None:
-        print(f"\n  {B}Parcelas — Entrada Faseada{R}  {DIM}($5 cada){R}")
-        parcel_names = ["P1 Manhã", "P2 Modelo+Mercado", "P3 Alta confiança"]
-        parcel_icons = ["🌅", "⚡", "🔥"]
+        # Detectar se é SINGLE ou PHASED
+        is_single = hasattr(phased, 'bought')  # SingleEntry tem 'bought', PhasedEntry tem 'parcel_bought'
 
-        for pidx in range(3):
-            bought = phased.parcel_bought[pidx]
-            rec    = phased.parcel_records[pidx]
-
-            if bought and rec:
+        if is_single:
+            # Modo SINGLE
+            print(f"\n  {B}Entrada — SINGLE{R}  {DIM}(${phased.parcel_size:.0f}){R}")
+            if phased.bought and phased.record:
                 icon = f"{C['green']}✅{R}"
-                detail = f"ask {rec.get('ask',0)*100:.0f}¢  ${rec.get('size_usdc',5):.0f}"
-                print(f"    {icon} {parcel_icons[pidx]} {parcel_names[pidx]:<20} {B}{detail}{R}")
+                detail = f"ask {phased.record.get('ask',0)*100:.0f}¢  ${phased.record.get('size_usdc',0):.0f}"
+                print(f"    {icon} Single Buy  {B}{detail}{R}")
             else:
-                if pidx == 0:
-                    fc_ok = forecast_agreement.get("valid", False) if forecast_agreement else False
-                    cond = f"hora<12 + fc_agree={'✅' if fc_ok else '❌'}"
-                elif pidx == 1:
-                    mkt_ok, mkt_detail = phased._market_confirms_model(market, rmax)
-                    cond = f"p>60% {'✅' if p >= 0.60 else '❌'} + mercado {'✅' if mkt_ok else '❌'}"
-                else:
-                    cond = f"p>80% {'✅' if p >= 0.80 else '❌'}"
                 icon = f"{C['gray']}⬜{R}"
-                print(f"    {icon} {parcel_icons[pidx]} {parcel_names[pidx]:<20} {DIM}{cond}{R}")
+                cond = f"p>={phased.threshold*100:.0f}% {'✅' if p >= phased.threshold else '❌'}"
+                print(f"    {icon} Single Buy  {DIM}{cond}{R}")
+            print(f"    {DIM}Investido: ${phased.total_invested:.0f}{R}")
+        else:
+            # Modo PHASED
+            print(f"\n  {B}Parcelas — Entrada Faseada{R}  {DIM}($5 cada){R}")
+            parcel_names = ["P1 Manhã", "P2 Modelo+Mercado", "P3 Alta confiança"]
+            parcel_icons = ["🌅", "⚡", "🔥"]
 
-        print(f"    {DIM}Total: {phased.n_parcels_bought}/3  ${phased.total_invested:.0f}{R}")
+            for pidx in range(3):
+                bought = phased.parcel_bought[pidx]
+                rec    = phased.parcel_records[pidx]
+
+                if bought and rec:
+                    icon = f"{C['green']}✅{R}"
+                    detail = f"ask {rec.get('ask',0)*100:.0f}¢  ${rec.get('size_usdc',5):.0f}"
+                    print(f"    {icon} {parcel_icons[pidx]} {parcel_names[pidx]:<20} {B}{detail}{R}")
+                else:
+                    if pidx == 0:
+                        fc_ok = forecast_agreement.get("valid", False) if forecast_agreement else False
+                        cond = f"hora<12 + fc_agree={'✅' if fc_ok else '❌'}"
+                    elif pidx == 1:
+                        # Verificar se o método existe para evitar erro no SINGLE
+                        if hasattr(phased, '_market_confirms_model'):
+                            mkt_ok, mkt_detail = phased._market_confirms_model(market, rmax)
+                            cond = f"p>70% {'✅' if p >= 0.70 else '❌'} + mercado {'✅' if mkt_ok else '❌'}"
+                        else:
+                            cond = f"p>70% {'✅' if p >= 0.70 else '❌'}"
+                    else:
+                        cond = f"p>85% {'✅' if p >= 0.85 else '❌'}"
+                    icon = f"{C['gray']}⬜{R}"
+                    print(f"    {icon} {parcel_icons[pidx]} {parcel_names[pidx]:<20} {DIM}{cond}{R}")
+
+            print(f"    {DIM}Total: {phased.n_parcels_bought}/3  ${phased.total_invested:.0f}{R}")
 
     # ── Mercado ───────────────────────────────────────
     _md = market_date or berlin_date()
