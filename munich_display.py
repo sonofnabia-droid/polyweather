@@ -222,7 +222,7 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
             forecast_max=None, berlin_now_dt=None,
             signal_window_label="", obs_min_today: dict = None,
             phased=None, forecast_agreement=None, om_forecast=None,
-            ensemble_result=None):
+            ensemble_result=None, show_dual_forecast=True):
 
     os.system('clear' if os.name != 'nt' else 'cls')
     pc = p_col(p)
@@ -267,7 +267,7 @@ def display(now, latest_obs, temps_by_hour, series_today, signals, p,
     print(f"    {DIM}running max:{R} {B}{C['white']}{int(round(rmax))}°C{R}  {DIM}@{R} {C['cyan']}{B}{rmax_time_str}{R}")
 
     # ── Dual Forecast ─────────────────────────────────
-    if forecast_max or om_forecast:
+    if show_dual_forecast and (forecast_max or om_forecast):
         print(f"\n  {B}Previsao Dual{R}")
         if forecast_max:
             fc_col = C["green"] if forecast_max["temp_max"] <= rmax else C["yellow"]

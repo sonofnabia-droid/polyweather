@@ -87,8 +87,10 @@ def get_real_usdc_balance(private_key: str) -> float | None:
                     best = bal
             except Exception:
                 pass
-        return best if best > 0 else None
-    except Exception:
+        # Retornar 0.0 se não houver saldo em vez de None
+        return best
+    except Exception as e:
+        print(f"  {C['yellow']}Erro ao obter saldo: {e}{R}")
         return None
 
 
@@ -723,6 +725,9 @@ def run(wu_key: str, threshold: float, bankroll: float,
                             market=market)
                     else:
                         tg.alert_order_placed(bet, clob_mode_str)
+                elif bet_blocked_reason:
+                    # Alertar quando a bet é bloqueada
+                    tg.alert_bet_blocked(bet_blocked_reason, p)
 
                 break  # 1 parcela por tick
 
@@ -758,6 +763,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 forecast_agreement = forecast_agreement,
                 om_forecast        = om_forecast,
                 ensemble_result    = ensemble_result,
+                show_dual_forecast = (mode == "phased"),  # Só mostra previsão dual em PHASED
             )
 
             log_tick(

@@ -137,6 +137,16 @@ class TG:
         ]
         return self.send("\n".join(lines))
 
+    def alert_bet_blocked(self, reason: str, p_ensemble: float = 0.0) -> bool:
+        """Alerta quando uma bet é bloqueada."""
+        lines = [
+            "🚫 <b>Bet bloqueada</b>",
+            f"  Motivo: <code>{reason[:200]}</code>",
+        ]
+        if p_ensemble > 0:
+            lines.append(f"  p_ensemble: {p_ensemble*100:.1f}%")
+        return self.send("\n".join(lines))
+
     def alert_position_resolved(self, pos) -> bool:
         won      = pos.status.value == "won"
         icon     = "🏆" if won else "💸"
