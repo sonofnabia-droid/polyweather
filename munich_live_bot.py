@@ -426,6 +426,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
             continue
         current_extra = {
             "hour": h, "slot30": s,
+            "temp_c": slot["temp_c"],
             "cloud_cover": slot.get("cloud_cover", 50),
             "humidity":    slot.get("humidity", 70),
             "prev_7d_avg_max": compute_prev7(history_max, today),
@@ -570,6 +571,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
             if len(slots_so_far) >= 4 and h_cur >= MIN_HOUR:
                 current_extra = {
                     "hour": h_cur, "slot30": s30_cur,
+                    "temp_c": latest_obs["temp_c"] if latest_obs else 0,
                     "cloud_cover": cloud_by_hour.get(h_cur, 50.0),
                     "humidity": (latest_obs.get("humidity", 70)
                                 if latest_obs else 70),
