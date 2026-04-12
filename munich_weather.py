@@ -66,14 +66,24 @@ def _wu_parse_obs(obs_list: list) -> list[dict]:
             continue
         clds_raw    = str(obs.get("clds", "") or "").upper().strip()
         cloud_cover = clds_map.get(clds_raw, 50)
+
+        # V2 features com defaults se não disponíveis
+        temp_c = float(temp)
         rows.append({
             "hour":        dt.hour,
             "minute":      dt.minute,
-            "temp_c":      int(round(float(temp))),
+            "temp_c":      temp_c,
             "humidity":    int(round(float(obs.get("rh") or 70))),
             "cloud_cover": cloud_cover,
             "wx":          str(obs.get("wx_phrase", "") or ""),
             "source":      "WU",
+            # V2 features
+            "dewpoint_c":  float(obs.get("dewpt") or (temp_c - 10)),
+            "pressure_hpa": float(obs.get("pressure") or 1013),
+            "wind_dir_deg": float(obs.get("wdir") or 0),
+            "wind_speed_kmh": float(obs.get("wspd") or 5) * 3.6 if obs.get("wspd") else 5.0,
+            "wind_gust_kmh": float(obs.get("gust") or 8) * 3.6 if obs.get("gust") else 8.0,
+            "uv_index":    float(obs.get("uv_index") or 3),
         })
     return rows
 
@@ -162,6 +172,13 @@ def bootstrap_today(api_key: str,
                 "cloud_cover": r.get("cloud_cover", 50),
                 "humidity":    r.get("humidity", 70),
                 "source":      "WU",
+                # V2 features
+                "dewpoint_c":  r.get("dewpoint_c", r["temp_c"] - 10),
+                "pressure_hpa":  r.get("pressure_hpa", 1013),
+                "wind_dir_deg":  r.get("wind_dir_deg", 0),
+                "wind_speed_kmh": r.get("wind_speed_kmh", 5),
+                "wind_gust_kmh": r.get("wind_gust_kmh", 8),
+                "uv_index":     r.get("uv_index", 3),
             })
     return series, slots
 
