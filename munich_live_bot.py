@@ -1,11 +1,11 @@
 """
 munich_live_bot.py
 ==================
-Bot de trading ao vivo — Temperatura Maxima Munich — Polymarket V3.
+Bot de trading ao vivo — Temperatura Maxima Munich — Polymarket V4.
 
 Modos de entrada:
-  --mode phased  → 3 parcelas $5 (P1 manhã invertida, P2 dupla, P3 alta)
-  --mode single  → 1 compra $15 quando p_ensemble >= 75%
+  --mode phased  → 3 parcelas $5 (P1 value early 30-65%, P2 70%, P3 85%)
+  --mode single  → 1 compra $15 quando p_ensemble >= 75% [MODO PADRÃO]
 
 Modos de trading:
   --run paper    → Paper sem perguntar
@@ -17,9 +17,9 @@ Variaveis de ambiente:
     export POLY_PRIVATE_KEY="0x..."
 
 Uso:
-    python munich_live_bot.py                           # pergunta tudo
+    python munich_live_bot.py                           # pergunta tudo (default: single)
     python munich_live_bot.py --run paper --mode phased  # paper faseado
-    python munich_live_bot.py --run paper --mode single  # paper simples
+    python munich_live_bot.py --run paper               # paper single (default)
     python munich_live_bot.py --run real --yes           # real headless
 """
 
@@ -834,8 +834,8 @@ def main():
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Headless (não perguntar nada)")
     parser.add_argument("--mode", choices=["phased", "single"],
-                        default="phased",
-                        help="phased=3 parcelas $5, single=1 compra $15")
+                        default="single",
+                        help="phased=3 parcelas $5, single=1 compra $15 [default]")
     parser.add_argument("--run", choices=["paper", "real"], default=None,
                         help="Forçar modo paper/real sem perguntar")
     args = parser.parse_args()

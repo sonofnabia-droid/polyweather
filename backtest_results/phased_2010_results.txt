@@ -1,0 +1,43 @@
+Data de início (YYYY-MM-DD): 
+  Backtest V3: 2010-01-01 → 2026-04-11  [PHASED 3x5]
+
+[1/5] Modelos...
+    [32m✓[0m LightGBM + XGBoost + Z-Score  [33mAUC[0m=[1;36m0[0m[1;36m.967[0m  [33mfeatures[0m=[1;36m25[0m  [33mweights[0m=[1m[[0mLGBM [1;36m50[0m% 
+XGB [1;36m30[0m% Z [1;36m20[0m%[1m][0m
+
+[2/5] Dados...
+    289,582 slots  9168 dias
+  188,955 slots no intervalo
+
+[3/5] Backtest (PHASED 3x5)...
+Dias... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:40:38 0:00:00
+
+[4/5] Métricas...
+
+[92m──────────────────────────── [0m[1;36mResultados V3 — PHASED[0m[92m ────────────────────────────[0m
+                                               
+ [2m  [0m[2mDias analisados           [0m[2m  [0m [1;37m  [0m[1;37m5912      [0m[1;37m  [0m 
+ [2m  [0m[2mCorrecto                  [0m[2m  [0m [1;37m  [0m[1;32m85.2%[0m[1;37m     [0m[1;37m  [0m 
+ [2m  [0m[2mPrematuro                 [0m[2m  [0m [1;37m  [0m[1;33m12.7%[0m[1;37m     [0m[1;37m  [0m 
+ [2m  [0m[2mNão detectado             [0m[2m  [0m [1;37m  [0m[1;31m2.0%[0m[1;37m      [0m[1;37m  [0m 
+ [2m  [0m[2mLag médio (correctos)     [0m[2m  [0m [1;37m  [0m[1;37m+1.92h    [0m[1;37m  [0m 
+ [2m  [0m[2mLag ≤ 1h                  [0m[2m  [0m [1;37m  [0m[1;37m49.0%     [0m[1;37m  [0m 
+ [2m  [0m[2mLag ≤ 2h                  [0m[2m  [0m [1;37m  [0m[1;37m71.7%     [0m[1;37m  [0m 
+ [2m  [0m[2mP1 Manhã (10h–12h)        [0m[2m  [0m [1;37m  [0m[1;37m5.4% dias [0m[1;37m  [0m 
+ [2m  [0m[2mP2 Modelo+Mercado         [0m[2m  [0m [1;37m  [0m[1;37m79.9% dias[0m[1;37m  [0m 
+ [2m  [0m[2mP3 Alta confiança         [0m[2m  [0m [1;37m  [0m[1;37m97.4% dias[0m[1;37m  [0m 
+ [2m  [0m[2mInvest. médio/dia         [0m[2m  [0m [1;37m  [0m[1;37m$9.13     [0m[1;37m  [0m 
+                                               
+[2m───────────────────────────────── [0m[36mPor Estação[0m[2m ──────────────────────────────────[0m
+                                                
+ [1m  [0m[1mEstação     [0m[1m  [0m [1m  [0m[1m  Correcto[0m[1m  [0m [1m  [0m[1m Lag médio[0m[1m  [0m 
+ ────────────────────────────────────────────── 
+ [36m  [0m[36m❄️ winter   [0m[36m  [0m        [32m83.6%[0m         +3.42h   
+ [36m  [0m[36m🌱spring    [0m[36m  [0m        [32m85.8%[0m         +1.44h   
+ [36m  [0m[36m☀️ summer   [0m[36m  [0m        [32m87.6%[0m         +1.19h   
+ [36m  [0m[36m🍂autumn    [0m[36m  [0m        [32m84.0%[0m         +1.64h   
+                                                
+
+[5/5] Dashboard...
+  A gerar gráficos...
+  Dashboard guardado: backtest_results/munich_backtest_phased_2010.png

@@ -968,7 +968,7 @@ def plot(results, slots_df, metrics, start_year, mode="phased"):
     # 9. Resumo
     ax9 = fig.add_subplot(gs[3, 2])
     ax9.axis("off")
-    mode_tag = "PHASED 3×$5" if mode == "phased" else "SINGLE 1×$15"
+    mode_tag = "PHASED 3x5" if mode == "phased" else "SINGLE 1x15"
     summary_lines = [
         f"Modo: {mode_tag}",
         f"Dias: {metrics['n_days']}",
@@ -1034,7 +1034,7 @@ def main():
     start_date = pd.to_datetime(start_str).date()
     end_date   = date.today() - timedelta(days=1)
 
-    mode_label = "PHASED 3×$5" if args.mode == "phased" else "SINGLE 1×$15"
+    mode_label = "PHASED 3x5" if args.mode == "phased" else "SINGLE 1x15"
     print(f"\n  Backtest V3: {start_date} → {end_date}  [{mode_label}]")
 
     print("\n[1/5] Modelos...")

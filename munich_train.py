@@ -5,7 +5,7 @@ Treino do modelo de pico max temp Munich — V3 Ensemble.
 
 Pipeline:
   1. Carregar historic/munich.csv (desde 2010)
-  2. Construir features 30min CEILING (18 features V1 canónicas)
+  2. Construir features 30min CEILING (18 V1 + 7 V2 = 25 features)
   3. Walk-Forward Validation (expanding window por ano)
   4. Treinar LightGBM + XGBoost em paralelo
   5. Calcular threshold adaptativo (curva DOY contínua)
@@ -33,12 +33,13 @@ from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import roc_auc_score, f1_score
 
+warnings.filterwarnings("ignore")
+
 # ══════════════════════════════════════════════════════
-#  CORES ANSI (para compatibilidade com munich_config)
+#  CORES ANSI
 # ══════════════════════════════════════════════════════
 R   = "\033[0m"
 DIM = "\033[2m"
-warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════
 #  PATHS & CONSTANTS
@@ -51,8 +52,9 @@ DAY_START = 6
 DAY_END   = 21
 MIN_HOUR  = 6
 
-# 18 FEATURES V1 CANÓNICAS — NÃO ALTERAR sem re-treino
+# 18 FEATURES V1 + 7 V2 PREDITIVAS = 25 total
 FEATURE_COLS = [
+    # ── V1 Canónicas (18) ──
     "slot_frac",
     "doy_sin", "doy_cos",
     "temp_c", "running_max",
@@ -67,6 +69,14 @@ FEATURE_COLS = [
     "humidity_drop_1h",
     "prev_7d_avg_max",
     "seasonal_peak_prior",
+    # ── V2 PREDITIVAS (7) ──
+    "dewpoint_c",
+    "temp_to_dewpoint_gap",
+    "pressure_trend_3h",
+    "wind_south_proxy",
+    "wind_speed_kmh",
+    "uv_index",
+    "foehn_indicator",
 ]
 
 
@@ -139,6 +149,22 @@ def load_csv(csv_path: Path = DATA_CSV) -> pd.DataFrame:
     else:
         raw["cloud_cover"] = 50.0
 
+    # ── V2: Colunas preditivas ───────────────────────
+    raw["dewpoint_c"]     = pd.to_numeric(raw.get("dewpt_c"), errors="coerce")
+    raw["pressure_hpa"]   = pd.to_numeric(raw.get("pressure_hpa"), errors="coerce")
+    raw["wind_dir_deg"]   = pd.to_numeric(raw.get("wind_dir_deg"), errors="coerce")
+    raw["wind_speed_kmh"] = pd.to_numeric(raw.get("wind_speed_kmh"), errors="coerce")
+    raw["wind_gust_kmh"]  = pd.to_numeric(raw.get("wind_gust_kmh"), errors="coerce")
+    raw["uv_index"]       = pd.to_numeric(raw.get("uv_index"), errors="coerce")
+
+    # Defaults para NaNs (especialmente 2010)
+    raw["dewpoint_c"]     = raw["dewpoint_c"].fillna(raw["temp_c"] - 10)
+    raw["pressure_hpa"]   = raw["pressure_hpa"].fillna(1013.0)
+    raw["wind_dir_deg"]   = raw["wind_dir_deg"].fillna(0.0)
+    raw["wind_speed_kmh"] = raw["wind_speed_kmh"].fillna(5.0)
+    raw["wind_gust_kmh"]  = raw["wind_gust_kmh"].fillna(8.0)
+    raw["uv_index"]       = raw["uv_index"].fillna(3.0)
+
     df = raw[
         (raw["hour"] >= DAY_START) & (raw["hour"] <= DAY_END)
     ].dropna(subset=["temp_c"]).sort_values(
@@ -155,7 +181,7 @@ def load_csv(csv_path: Path = DATA_CSV) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════
 def build_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Constrói o dataset de treino slot a slot com as 18 features V1.
+    Constrói o dataset de treino slot a slot com 25 features (18 V1 + 7 V2).
     """
     print("  A construir dataset slot a slot...")
 
@@ -212,6 +238,12 @@ def build_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             slot_entry = {
                 "hour": h, "slot30": s, "temp_c": t,
                 "cloud_cover": cl, "humidity": hu,
+                "dewpoint_c":    float(row.get("dewpoint_c", t - 10)),
+                "pressure_hpa":  float(row.get("pressure_hpa", 1013)),
+                "wind_dir_deg":  float(row.get("wind_dir_deg", 0)),
+                "wind_speed_kmh":float(row.get("wind_speed_kmh", 5)),
+                "wind_gust_kmh": float(row.get("wind_gust_kmh", 8)),
+                "uv_index":      float(row.get("uv_index", 3)),
             }
             slots_so_far.append(slot_entry)
 
@@ -257,7 +289,37 @@ def build_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             prev7 = prev7_map.get(d, rmax)
             prior = prior_map.get((month, h, s), 0.5)
 
+            # ── Features V2 ────────────────────────────
+            dewpt = slot_entry["dewpoint_c"]
+            pres  = slot_entry["pressure_hpa"]
+            wdir  = slot_entry["wind_dir_deg"]
+            wspd  = slot_entry["wind_speed_kmh"]
+            wgst  = slot_entry["wind_gust_kmh"]
+            uv    = slot_entry["uv_index"]
+
+            temp_to_dewpoint_gap = max(0.0, cur - dewpt)
+
+            # Pressure trend: últimas 3h (6 slots)
+            press_vals = [sl["pressure_hpa"] for sl in slots_so_far[-6:]]
+            if len(press_vals) >= 2:
+                pressure_trend_3h = press_vals[-1] - press_vals[0]
+            else:
+                pressure_trend_3h = 0.0
+
+            # Wind south proxy: alinhamento com 180° (Sul)
+            if 135 <= wdir <= 225:
+                wind_south_proxy = 1.0 - abs(wdir - 180) / 45.0
+            else:
+                wind_south_proxy = 0.0
+
+            # Foehn: vento sul + rajadas + seco
+            foehn_south = 1.0 if 135 <= wdir <= 225 else 0.0
+            foehn_gusty = min(1.0, wgst / 30.0)
+            foehn_dry   = max(0.0, (80 - hu) / 20.0) if hu < 80 else 0.0
+            foehn_indicator = foehn_south * (0.4 + 0.3 * foehn_gusty + 0.3 * foehn_dry)
+
             feat_row = {
+                # ── V1 (18) ──
                 "slot_frac":           slot_frac,
                 "doy_sin":             float(np.sin(2 * np.pi * doy / 365)),
                 "doy_cos":             float(np.cos(2 * np.pi * doy / 365)),
@@ -276,6 +338,14 @@ def build_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
                 "humidity_drop_1h":    hum_drop,
                 "prev_7d_avg_max":     prev7,
                 "seasonal_peak_prior": prior,
+                # ── V2 (7) ──
+                "dewpoint_c":          dewpt,
+                "temp_to_dewpoint_gap": temp_to_dewpoint_gap,
+                "pressure_trend_3h":   pressure_trend_3h,
+                "wind_south_proxy":    wind_south_proxy,
+                "wind_speed_kmh":      wspd,
+                "uv_index":            uv,
+                "foehn_indicator":     foehn_indicator,
                 "label":               label,
                 "date":                d,
                 "month":               month,
@@ -454,35 +524,33 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     joblib.dump(lgb, OUTPUT_DIR / "lgbm_peak.pkl")
-    print(f"  ✓ {OUTPUT_DIR / 'lgbm_peak.pkl'}")
+    print(f"  OK {OUTPUT_DIR / 'lgbm_peak.pkl'}")
 
     if xgb is not None:
         joblib.dump(xgb, OUTPUT_DIR / "xgb_peak.pkl")
-        print(f"  ✓ {OUTPUT_DIR / 'xgb_peak.pkl'}")
+        print(f"  OK {OUTPUT_DIR / 'xgb_peak.pkl'}")
 
     # ── Feature Importances ──────────────────────────────
-    feat_cols = wf_results.get("feature_cols", FEATURE_COLS)
-    
+    feat_cols = FEATURE_COLS
+
     lgb_imp = lgb.feature_importances_
     lgb_imp_pct = lgb_imp / lgb_imp.sum()
-    
+
     if xgb is not None:
         xgb_imp = xgb.feature_importances_
         xgb_imp_pct = xgb_imp / xgb_imp.sum()
-        # Ensemble importance: 50% LGBM + 30% XGB
         ens_imp = 0.5 * lgb_imp_pct + 0.3 * xgb_imp_pct
         ens_imp_pct = ens_imp / ens_imp.sum()
     else:
         xgb_imp_pct = None
         ens_imp_pct = lgb_imp_pct
 
-    # Ordenar por importância
     sorted_idx = np.argsort(ens_imp_pct)[::-1]
-    
+
     lgb_importance_dict = {}
     xgb_importance_dict = {}
     ensemble_importance_dict = {}
-    
+
     for i in sorted_idx:
         fname = feat_cols[i]
         lgb_importance_dict[fname] = round(float(lgb_imp_pct[i]) * 100, 2)
@@ -515,14 +583,18 @@ def save_models(lgb, xgb, prior_map, doy_poly, wf_results: dict,
     (OUTPUT_DIR / "peak_model_config.json").write_text(
         json.dumps(config, indent=2)
     )
-    print(f"  ✓ {OUTPUT_DIR / 'peak_model_config.json'}")
+    print(f"  OK {OUTPUT_DIR / 'peak_model_config.json'}")
 
     # ── Mostrar Top 10 ─────────────────────────────────
     print(f"\n  Top 10 Features (Ensemble Importance):")
+    v2_names = {"dewpoint_c", "temp_to_dewpoint_gap", "pressure_trend_3h",
+                "wind_south_proxy", "wind_speed_kmh", "uv_index", "foehn_indicator"}
     for rank, i in enumerate(sorted_idx[:10], 1):
         pct = ens_imp_pct[i] * 100
-        bar = '█' * int(pct / 2)
-        print(f"    {rank:>2}. {feat_cols[i]:<24} {pct:>5.1f}%  {DIM}{bar}{R}")
+        bar = '#' * int(pct / 2)
+        v2_tag = " [V2]" if feat_cols[i] in v2_names else ""
+        print(f"    {rank:>2}. {feat_cols[i]:<24} {pct:>5.1f}%  {DIM}{bar}{R}{v2_tag}")
+
 
 # ══════════════════════════════════════════════════════
 #  MAIN
@@ -572,7 +644,7 @@ def main():
     print("\nA guardar modelos...")
     save_models(lgb, xgb, prior_map, doy_poly, wf_results, train_xgb=train_xgb)
 
-    print("\n✅ Treino completo!")
+    print("\nTreino completo!")
 
 
 if __name__ == "__main__":

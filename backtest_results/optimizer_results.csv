@@ -1,0 +1,6 @@
+mode,threshold,correct_pct,premature_pct,missed_pct,lag_mean_h,avg_invested,winter_correct_pct,spring_correct_pct,summer_correct_pct,autumn_correct_pct
+single,0.65,77.2,22.8,0.0,1.32,15.0,74.2,80.8,76.6,78.0
+single,0.7,83.0,17.0,0.0,1.46,15.0,81.7,84.8,81.5,84.1
+single,0.75,88.7,11.3,0.0,1.64,15.0,87.9,89.9,88.0,89.0
+single,0.8,93.7,6.3,0.0,1.93,15.0,93.3,92.9,92.9,95.6
+single,0.85,95.4,1.9,2.7,2.99,14.59,91.7,97.5,96.7,96.7
