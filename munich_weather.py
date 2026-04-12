@@ -116,16 +116,46 @@ def fetch_wu_forecast_max(api_key: str,
         }, timeout=15)
         r.raise_for_status()
         d = r.json()
-        t_max_list = d.get("temperatureMax", [None])
-        t_min_list = d.get("temperatureMin", [None])
-        t_max = (int(round(float(t_max_list[0])))
-                 if t_max_list and t_max_list[0] is not None else None)
-        t_min = (int(round(float(t_min_list[0])))
-                 if t_min_list and t_min_list[0] is not None else None)
-        if t_max is None:
+
+        # Debug: verificar estrutura da resposta
+        if not d:
+            print(f"  {C['yellow']}WU forecast: resposta vazia{R}")
             return None
+
+        # Tentar diferentes caminhos possíveis para temperatura
+        t_max = None
+        t_min = None
+
+        # Caminho 1: temperatureMax/temperatureMin (formato antigo)
+        if "temperatureMax" in d and "temperatureMin" in d:
+            t_max_list = d.get("temperatureMax", [None])
+            t_min_list = d.get("temperatureMin", [None])
+            t_max = (int(round(float(t_max_list[0])))
+                     if t_max_list and t_max_list[0] is not None else None)
+            t_min = (int(round(float(t_min_list[0])))
+                     if t_min_list and t_min_list[0] is not None else None)
+
+        # Caminho 2: daily.temperatureMax/daily.temperatureMin (formato novo)
+        elif "daily" in d:
+            daily = d["daily"]
+            if "temperatureMax" in daily and "temperatureMin" in daily:
+                t_max_list = daily.get("temperatureMax", [None])
+                t_min_list = daily.get("temperatureMin", [None])
+                t_max = (int(round(float(t_max_list[0])))
+                         if t_max_list and t_max_list[0] is not None else None)
+                t_min = (int(round(float(t_min_list[0]))
+                         if t_min_list and t_min_list[0] is not None else None))
+
+        if t_max is None:
+            print(f"  {C['yellow']}WU forecast: sem temp_max na resposta{R}")
+            return None
+
         return {"temp_max": t_max, "temp_min": t_min, "source": "WU"}
-    except Exception:
+    except requests.exceptions.HTTPError as e:
+        print(f"  {C['yellow']}WU forecast HTTP error: {e.response.status_code}{R}")
+        return None
+    except Exception as e:
+        print(f"  {C['yellow']}WU forecast error: {e}{R}")
         return None
 
 
