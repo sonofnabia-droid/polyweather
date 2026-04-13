@@ -383,10 +383,12 @@ def run(wu_key: str, threshold: float, bankroll: float,
     set_seasonal_prior(models["prior_map"])
 
     def get_threshold(month, doy=0):
-        if models["doy_poly"] is not None and doy > 0:
-            val = float(np.polyval(models["doy_poly"], (doy - 183) / 183))
-            return float(np.clip(val, 0.25, 0.95))
-        return models["monthly_threshold"].get(month, threshold)
+        # Nota: Threshold fixo de 0.80 (80%) é melhor que threshold adaptativo
+        # Backtest 2010-2026:
+        #   - Adaptive (39-45%): 58.4% correcto, 41.6% prematuro
+        #   - Fixo 80%: 89.2% correcto, 10.8% prematuro
+        # O threshold adaptativo gerou valores muito baixos (39-45%) para todo o ano
+        return 0.80
 
     # ── Bootstrap ─────────────────────────────────────
     today = berlin_date()
@@ -404,7 +406,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
     zscore = StreamingPeakDetector()
 
     if mode == "single":
-        entry = SingleEntry(parcel_size=15.0, threshold=0.75)
+        entry = SingleEntry(parcel_size=15.0, threshold=0.80)
     else:
         entry = PhasedEntry(parcel_size=5.0)
 

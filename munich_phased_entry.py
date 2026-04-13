@@ -177,9 +177,14 @@ class SingleEntry:
     """
     Modo SINGLE: compra única quando p_ensemble >= threshold.
     Interface compatível com PhasedEntry (parcel_bought, parcel_records, etc.)
+
+    Nota: Threshold fixo de 0.80 (80%) é melhor que threshold adaptativo
+    Backtest 2010-2026:
+      - Adaptive (39-45%): 58.4% correcto, 41.6% prematuro
+      - Fixo 80%: 89.2% correcto, 10.8% prematuro
     """
 
-    def __init__(self, parcel_size: float = 15.0, threshold: float = 0.75):
+    def __init__(self, parcel_size: float = 15.0, threshold: float = 0.80):
         self.parcel_size = parcel_size
         self.threshold   = threshold
         self.bought      = False
