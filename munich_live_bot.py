@@ -707,8 +707,9 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                 usdc_balance = get_real_usdc_balance(
                                     POLY_PRIVATE_KEY)
                             else:
+                                error_msg = result.get("error", "desconhecido")
                                 bet_blocked_reason = (
-                                    f"P{pidx+1}: ordem falhou")
+                                    f"P{pidx+1}: ordem falhou ({error_msg[:100]})")
                         else:
                             bet_blocked_reason = "executor não disponível"
                     else:
