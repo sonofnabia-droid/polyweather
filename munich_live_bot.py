@@ -12,9 +12,14 @@ Estrategia de Entrada (3 Fases com Dupla Condicao):
   1. INICIAL: As 10:00 Berlin, se o Mercado confirmar (ask entre 10¢ e 90¢)
   2. AMARELO: Quando P(pico) >= 60%, se o Mercado confirmar
   3. VERDE:   Quando P(pico) >= 80%, se o Mercado confirmar
-  
+
   Cada fase aposta $5.50. Total maximo por dia: $16.50.
-  A "Confirmacao do Mercado" evita comprar a 99¢ (sem edge) ou a 1¢ (mercado descarta).
+
+Stop-Loss por Bracket:
+  Se a temperatura subir 1°C acima do tecto do bracket comprado,
+  esse bracket nunca resolve YES → vender ao bid imediatamente.
+  Exemplo: comprei "24°C", temperatura chega a 25°C → stop-loss.
+  Brackets "X°C or higher" não têm stop-loss por subida.
 
 Instalacao:
     pip install requests pandas numpy scikit-learn lightgbm joblib py-clob-client
@@ -63,9 +68,18 @@ from munich_model import (
 from munich_display import display, log_tick
 
 # ── Polymarket / execucao ─────────────────────────────
-from polymarket_clob import ClobClient, TradingMode, OrderBook, PositionManager, Position, PositionStatus
+from polymarket_clob import (ClobClient, TradingMode, OrderBook,
+                             PositionManager, Position, PositionStatus)
 from polymarket_orders import OrderExecutor, paper_buy
 from tg import TG
+
+
+# ══════════════════════════════════════════════════════
+#  CONSTANTES
+# ══════════════════════════════════════════════════════
+
+# Graus acima do tecto do bracket que disparam o stop-loss
+STOP_LOSS_DEGREES = 1.0
 
 
 # ══════════════════════════════════════════════════════
@@ -73,24 +87,248 @@ from tg import TG
 # ══════════════════════════════════════════════════════
 
 class BetPhase(IntFlag):
-    NONE     = 0      # nenhuma aposta
-    INITIAL  = 1      # 10:00 / início do dia → $5.50
-    YELLOW   = 2      # P >= 60% (amarelo) → $5.50
-    GREEN    = 4      # P >= 80% (verde) → $5.50
-    DONE     = 7      # todas colocadas
+    NONE     = 0   # nenhuma aposta
+    INITIAL  = 1   # 10:00 / início do dia → $5.50
+    YELLOW   = 2   # P >= 60% (amarelo) → $5.50
+    GREEN    = 4   # P >= 80% (verde) → $5.50
+    DONE     = 7   # todas colocadas
 
 BET_SIZE_PER_PHASE = 5.50
 
 
 # ══════════════════════════════════════════════════════
-#  SALDO USDC — lê sig_type 0,1,2 e devolve o maior
+#  STOP-LOSS — LÓGICA DE BRACKET
+# ══════════════════════════════════════════════════════
+
+def bracket_ceiling(bracket: dict) -> float | None:
+    """
+    Retorna o tecto (temp_hi) do bracket.
+    Brackets 'X°C or higher' têm temp_hi=99 → sem stop-loss por subida.
+    Retorna None se não aplicável.
+    """
+    temp_hi = bracket.get("temp_hi", 99.0)
+    if temp_hi >= 99.0:
+        return None  # Sem stop-loss — temperatura mais alta = melhor
+    return float(temp_hi)
+
+
+def should_stop_loss(bracket: dict, current_temp: float) -> tuple[bool, str]:
+    """
+    Determina se o stop-loss deve ser acionado para um bracket comprado.
+
+    Args:
+        bracket:      dict do bracket comprado (precisa de 'temp_hi', 'label')
+        current_temp: temperatura actual observada
+
+    Returns:
+        (True, razão) se stop-loss deve ser acionado
+        (False, "") caso contrário
+    """
+    ceiling = bracket_ceiling(bracket)
+    if ceiling is None:
+        return False, ""
+
+    trigger_temp = ceiling + STOP_LOSS_DEGREES
+    if current_temp >= trigger_temp:
+        return True, (
+            f"temp {current_temp:.1f}°C >= "
+            f"tecto {ceiling:.0f}°C + {STOP_LOSS_DEGREES:.0f}°C = {trigger_temp:.0f}°C"
+        )
+    return False, ""
+
+
+class BracketPosition:
+    """
+    Representa uma posição aberta num bracket do Polymarket.
+    Rastreia entrada, estado e stop-loss.
+    """
+    def __init__(self, phase: BetPhase, bracket: dict, bet_record: dict):
+        self.phase       = phase
+        self.bracket     = bracket          # dict completo do bracket
+        self.bet_record  = bet_record       # registo completo da aposta
+        self.entry_ask   = bet_record.get("ask", 0.0)
+        self.size_usdc   = bet_record.get("bet_size", BET_SIZE_PER_PHASE)
+        self.shares      = (self.size_usdc / self.entry_ask
+                            if self.entry_ask > 0 else 0.0)
+        self.token_id    = bracket.get("token_id", "")
+        self.label       = bracket.get("label", "")
+        self.temp_hi     = bracket.get("temp_hi", 99.0)
+        self.entry_time  = datetime.now()
+
+        # Estado
+        self.stopped_out  = False
+        self.stop_price   = None    # preço de saída do stop-loss
+        self.stop_time    = None
+        self.stop_reason  = ""
+        self.order_id     = bet_record.get("order_id", "")
+
+    @property
+    def ceiling(self) -> float | None:
+        return bracket_ceiling(self.bracket)
+
+    @property
+    def stop_trigger_temp(self) -> float | None:
+        c = self.ceiling
+        return (c + STOP_LOSS_DEGREES) if c is not None else None
+
+    def check_and_trigger(self, current_temp: float) -> bool:
+        """
+        Verifica se deve acionar o stop-loss dado a temperatura actual.
+        Retorna True se acabou de ser acionado (primeira vez).
+        """
+        if self.stopped_out:
+            return False
+        triggered, reason = should_stop_loss(self.bracket, current_temp)
+        if triggered:
+            self.stopped_out = True
+            self.stop_reason = reason
+            self.stop_time   = datetime.now()
+            return True
+        return False
+
+    def pnl_if_stopped(self, exit_bid: float) -> float:
+        """PnL realizado se o stop-loss for executado ao bid dado."""
+        proceeds  = exit_bid * self.shares
+        return proceeds - self.size_usdc
+
+    def __repr__(self):
+        phase_name = self.phase.name
+        if self.stopped_out:
+            return (f"<BracketPosition {phase_name} {self.label} "
+                    f"STOPPED @ {self.stop_price}¢>")
+        trig = self.stop_trigger_temp
+        trig_str = f"stop@{trig:.0f}°C" if trig else "no-stop"
+        return (f"<BracketPosition {phase_name} {self.label} "
+                f"entry={self.entry_ask*100:.1f}¢ {trig_str}>")
+
+
+# ══════════════════════════════════════════════════════
+#  STOP-LOSS EXECUTION
+# ══════════════════════════════════════════════════════
+
+def execute_stop_loss(
+    position: BracketPosition,
+    clob: "ClobClient | None",
+    executor: "OrderExecutor | None",
+    trading_mode: "TradingMode",
+    tg: "TG",
+    current_temp: float,
+) -> dict:
+    """
+    Executa a venda do stop-loss para uma posição.
+
+    Paper: simula venda ao bid degradado.
+    Real:  tenta vender ao melhor bid disponível no CLOB.
+
+    Returns:
+        dict com 'success', 'exit_price', 'pnl_usdc', 'error'
+    """
+    label      = position.label
+    size_usdc  = position.size_usdc
+    shares     = position.shares
+    token_id   = position.token_id
+
+    print(
+        f"\n  {C['yellow']}{B}⚡ STOP-LOSS acionado!{R}  "
+        f"{label}  "
+        f"{C['red']}temp {current_temp:.1f}°C > tecto+{STOP_LOSS_DEGREES:.0f}°C{R}"
+    )
+
+    if trading_mode == TradingMode.PAPER:
+        # Simular bid degradado (bracket já out-of-the-money)
+        import random
+        degraded_bid  = max(0.01, position.entry_ask * random.uniform(0.20, 0.45))
+        exit_price    = round(degraded_bid, 4)
+        proceeds      = exit_price * shares
+        pnl           = proceeds - size_usdc
+
+        position.stop_price = exit_price
+
+        print(
+            f"  {C['yellow']}PAPER stop-loss:{R} "
+            f"venda simulada @ {exit_price*100:.1f}¢  "
+            f"PnL: {'+' if pnl >= 0 else ''}{pnl:.2f} USDC"
+        )
+
+        tg.send(
+            f"⚡ *STOP-LOSS* [{position.phase.name}]\n"
+            f"Bracket: {label}\n"
+            f"Razão: {position.stop_reason}\n"
+            f"Exit: {exit_price*100:.1f}¢  "
+            f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f} USDC\n"
+            f"_(PAPER)_"
+        )
+
+        return {
+            "success":    True,
+            "exit_price": exit_price,
+            "pnl_usdc":   round(pnl, 4),
+            "error":      None,
+        }
+
+    else:
+        # Modo REAL: obter bid do CLOB e vender
+        exit_price = None
+        error_msg  = None
+
+        try:
+            if clob and token_id:
+                book = clob.get_orderbook(token_id)
+                if book and book.best_bid and book.best_bid > 0:
+                    exit_price = book.best_bid
+        except Exception as e:
+            print(f"  {C['yellow']}⚠  Falha ao obter orderbook: {e}{R}")
+
+        if exit_price is None or exit_price <= 0:
+            error_msg  = "bid indisponível no CLOB"
+            exit_price = max(0.01, position.entry_ask * 0.30)
+            print(f"  {C['yellow']}⚠  {error_msg} — a usar fallback {exit_price*100:.1f}¢{R}")
+
+        pnl = exit_price * shares - size_usdc
+        position.stop_price = exit_price
+
+        if executor and token_id:
+            try:
+                result = executor.sell(
+                    token_id  = token_id,
+                    price     = exit_price,
+                    size_usdc = size_usdc,
+                    label     = f"{label} [STOP-LOSS]",
+                )
+                if not result.get("success"):
+                    error_msg = result.get("error", "erro desconhecido")
+                    print(f"  {C['red']}✗ Stop-loss sell falhou: {error_msg}{R}")
+            except Exception as e:
+                error_msg = str(e)
+                print(f"  {C['red']}✗ Excepção no stop-loss sell: {e}{R}")
+
+        print(
+            f"  {C['yellow']}Stop-loss REAL:{R} "
+            f"venda @ {exit_price*100:.1f}¢  "
+            f"PnL: {'+' if pnl >= 0 else ''}{pnl:.2f} USDC"
+        )
+
+        tg.send(
+            f"⚡ *STOP-LOSS REAL* [{position.phase.name}]\n"
+            f"Bracket: {label}\n"
+            f"Razão: {position.stop_reason}\n"
+            f"Exit: {exit_price*100:.1f}¢  "
+            f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f} USDC"
+            + (f"\n⚠ Erro: {error_msg}" if error_msg else "")
+        )
+
+        return {
+            "success":    True,
+            "exit_price": exit_price,
+            "pnl_usdc":   round(pnl, 4),
+            "error":      error_msg,
+        }
+
+
+# ══════════════════════════════════════════════════════
+#  SALDO USDC
 # ══════════════════════════════════════════════════════
 def get_real_usdc_balance(private_key: str) -> float | None:
-    """
-    Lê o saldo USDC real do CLOB tentando os 3 sig_types.
-    O saldo util para ordens esta tipicamente em sig_type=2.
-    Devolve o maior saldo encontrado entre os 3 tipos.
-    """
     try:
         from py_clob_client.client import ClobClient as _CC
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -119,76 +357,53 @@ def get_real_usdc_balance(private_key: str) -> float | None:
 # ══════════════════════════════════════════════════════
 #  DUPLA CONDIÇÃO: VALIDAÇÃO DE MERCADO
 # ══════════════════════════════════════════════════════
-def market_confirms_bracket(bracket: dict | None, min_ask: float = 0.10, max_ask: float = 0.95) -> tuple[bool, str]:
-    """
-    Verifica se o mercado oferece liquidez e preço razoável (Edge).
-    
-    Condições de FAIL (mercado NÃO confirma):
-      - ask < min_ask: mercado diz que é quase impossível (ex: ask a 1¢)
-      - ask > max_ask: mercado já sabe que é este (ex: ask a 99¢, sem edge)
-      - sem bid ou sem ask: order book vazio, não há liquidez
-    """
+def market_confirms_bracket(
+    bracket: dict | None,
+    min_ask: float = 0.10,
+    max_ask: float = 0.95,
+) -> tuple[bool, str]:
     if not bracket:
         return False, "sem bracket"
-    
     ask = bracket.get("ask") or bracket.get("price")
     bid = bracket.get("bid")
-    
     if ask is None:
         return False, "ask indisponivel"
-    
     if bid is None or bid <= 0:
         return False, "sem liquidez (sem bid)"
-    
     if ask < min_ask:
         return False, f"ask {ask*100:.1f}¢ muito baixo (mercado descarta)"
-    
     if ask > max_ask:
         return False, f"ask {ask*100:.1f}¢ muito alto (sem edge)"
-    
     return True, f"ask {ask*100:.1f}¢ OK"
 
 
-def find_best_value_bracket(market: dict, temp: float, max_ask: float = 0.90) -> dict | None:
-    """
-    Em vez de apanhar só o bracket exato da temperatura atual,
-    procura o bracket com MELHOR EDGE onde o mercado ainda está barato
-    e é próximo da temperatura real.
-    """
+def find_best_value_bracket(
+    market: dict,
+    temp: float,
+    max_ask: float = 0.90,
+) -> dict | None:
     if not market:
         return None
-    
     best_bracket = None
-    best_score = -999
-    
+    best_score   = -999
     for b in market["brackets"]:
         ask = b.get("ask") or b.get("price") or 1.0
-        
-        # Ignorar se o mercado já resolveu ou não há liquidez
         if ask >= max_ask or ask <= 0.01:
             continue
-            
         bid = b.get("bid")
         if not bid or bid <= 0:
             continue
-            
         lo, hi = b["temp_lo"], b["temp_hi"]
-        
-        # Pontuação de proximidade
         if lo <= temp <= hi:
-            proximity = 1.0  # Match exato
+            proximity = 1.0
         elif abs(temp - lo) <= 1.5 or abs(temp - hi) <= 1.5:
-            proximity = 0.5  # Adjacente próximo
+            proximity = 0.5
         else:
-            proximity = 0.0  # Longe demais
-            
-        # Score = Proximidade × (1 - Ask). Ask baixo + perto = melhor score
+            proximity = 0.0
         score = proximity * (1.0 - ask)
-        
         if score > best_score:
-            best_score = score
+            best_score   = score
             best_bracket = b
-            
     return best_bracket
 
 
@@ -277,7 +492,7 @@ def fetch_market(d: date) -> dict | None:
         outcomes  = m.get("outcomes",    "[]")
         prices    = m.get("outcomePrices","[]")
         token_ids = m.get("clobTokenIds","[]")
-        
+
         def _jload(x):
             if isinstance(x, str):
                 try: return json.loads(x)
@@ -336,7 +551,6 @@ def find_bracket(market: dict, temp: float) -> dict | None:
 
 
 def compute_ev(p: float, ask: float) -> dict | None:
-    """EV calculado sobre o ask do CLOB."""
     if not ask or not (0 < ask < 1): return None
     if ask >= 0.95: return None
     ev    = p - ask
@@ -352,37 +566,43 @@ def compute_ev(p: float, ask: float) -> dict | None:
     }
 
 
-def build_bet_record(bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
-                     max_daily_loss: float = 10.0, phase_name: str = "UNKNOWN") -> dict:
-    """
-    Sizing: Fixo em BET_SIZE_PER_PHASE ($5.50).
-    A dupla condicao (modelo + mercado) garante que so entramos quando ha edge.
-    """
-    ask      = ask_price if (ask_price := (bracket.get("ask") or bracket.get("price"))) else (ev["ask"] if ev else 0)
-    
-    # Tamanho fixo por fase
+def build_bet_record(
+    bracket, p, ev, bankroll, kelly_frac, mode: TradingMode,
+    max_daily_loss: float = 10.0,
+    phase_name: str = "UNKNOWN",
+) -> dict:
+    ask      = (bracket.get("ask") or bracket.get("price") or
+                (ev["ask"] if ev else 0))
     bet_size = BET_SIZE_PER_PHASE
-    
     shares   = round(bet_size / ask, 4) if ask > 0 else 0
     ev_cents  = ev["ev_cents"] if ev else None
     edge_pct  = ev["edge_pct"] if ev else None
+
+    # Stop-loss info para o registo
+    ceiling       = bracket_ceiling(bracket)
+    stop_trigger  = (ceiling + STOP_LOSS_DEGREES) if ceiling is not None else None
+
     return {
-        "mode":         mode.value,
-        "phase":        phase_name,
-        "bracket":      bracket["label"],
-        "token_id":     bracket.get("token_id"),
-        "ask":          round(ask, 4),
-        "bid":          round(bracket.get("bid") or ask, 4),
-        "spread":       round(bracket.get("spread") or 0, 4),
-        "p_true":       round(p, 3),
-        "ev_cents":     ev_cents,
-        "edge_pct":     edge_pct,
-        "sizing":       "fixed_phase",
+        "mode":           mode.value,
+        "phase":          phase_name,
+        "bracket":        bracket["label"],
+        "token_id":       bracket.get("token_id"),
+        "ask":            round(ask, 4),
+        "bid":            round(bracket.get("bid") or ask, 4),
+        "spread":         round(bracket.get("spread") or 0, 4),
+        "p_true":         round(p, 3),
+        "ev_cents":       ev_cents,
+        "edge_pct":       edge_pct,
+        "sizing":         "fixed_phase",
         "max_daily_loss": max_daily_loss,
-        "bet_size":     bet_size,
-        "shares":       shares,
-        "max_profit":   round(shares * (1 - ask), 2),
-        "timestamp":    datetime.now().isoformat(),
+        "bet_size":       bet_size,
+        "shares":         shares,
+        "max_profit":     round(shares * (1 - ask), 2),
+        # Stop-loss info
+        "bracket_temp_hi":   bracket.get("temp_hi", 99.0),
+        "stop_loss_trigger": stop_trigger,   # °C que activa o stop
+        "stop_loss_active":  (stop_trigger is not None),
+        "timestamp":         datetime.now().isoformat(),
     }
 
 
@@ -416,7 +636,6 @@ def execute_forced_entry(bracket, ask_price, p, ev,
                          bankroll, kelly_frac,
                          trading_mode, executor, market,
                          bets, bets_path) -> tuple:
-    """Executa entrada forcada — ignora fases, modelo e mercado."""
     if not bracket or not ask_price or not ev:
         return None, "sem bracket ou preco disponivel"
 
@@ -430,8 +649,10 @@ def execute_forced_entry(bracket, ask_price, p, ev,
         if ans != "s":
             return None, "cancelado pelo utilizador"
 
-    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac, trading_mode, 
-                                  max_daily_loss=POLY_MAX_DAILY_LOSS, phase_name="FORCED")
+    bet_record = build_bet_record(bracket, p, ev, bankroll, kelly_frac,
+                                  trading_mode,
+                                  max_daily_loss=POLY_MAX_DAILY_LOSS,
+                                  phase_name="FORCED")
 
     if trading_mode == TradingMode.PAPER:
         result = paper_buy(
@@ -470,7 +691,8 @@ def ask_trading_mode() -> TradingMode:
     print(f"\n  {B}{C['cyan']}── Munich Live Bot — Seleccao de Modo ──────────{R}")
     print(f"  {C['yellow']}[P]{R} PAPER  — simula ordens, order book real do CLOB")
     print(f"  {C['red']}[R]{R} REAL   — envia ordens reais ao Polymarket CLOB")
-    print(f"  {DIM}Estrategia: 3 Fases ($5.50 cada) com Dupla Condicao{R}")
+    print(f"  {DIM}Estrategia: 3 Fases (${BET_SIZE_PER_PHASE:.2f} cada) "
+          f"| Stop-Loss: temp > tecto+{STOP_LOSS_DEGREES:.0f}°C{R}")
     print()
 
     while True:
@@ -489,7 +711,9 @@ def ask_trading_mode() -> TradingMode:
             if not POLY_PRIVATE_KEY:
                 print(f"\n  {C['red']}{B}✗  POLY_PRIVATE_KEY nao definida.{R}\n")
                 try:
-                    alt = input(f"  Continuar em modo PAPER? ({C['yellow']}s{R}/{C['red']}n{R}): ").strip().lower()
+                    alt = input(
+                        f"  Continuar em modo PAPER? ({C['yellow']}s{R}/{C['red']}n{R}): "
+                    ).strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     raise SystemExit(0)
                 if alt == "s":
@@ -498,8 +722,9 @@ def ask_trading_mode() -> TradingMode:
                 else:
                     raise SystemExit(0)
 
-            print(f"\n  {C['red']}{B}⚠  MODO REAL — ordens reais serao enviadas ao Polymarket.{R}")
+            print(f"\n  {C['red']}{B}⚠  MODO REAL — ordens reais serao enviadas.{R}")
             print(f"  Stop-loss diario: ${POLY_MAX_DAILY_LOSS:.0f} USDC")
+            print(f"  Stop-loss bracket: +{STOP_LOSS_DEGREES:.0f}°C acima do tecto → venda auto")
 
             print(f"  {DIM}A verificar saldo USDC...{R}", end=" ", flush=True)
             usdc_balance_check = None
@@ -520,7 +745,9 @@ def ask_trading_mode() -> TradingMode:
                 if usdc_balance_check < 1.0:
                     print(f"\n  {C['red']}{B}✗  Saldo insuficiente.{R}\n")
                     try:
-                        alt = input(f"  Continuar em modo PAPER? ({C['yellow']}s{R}/{C['red']}n{R}): ").strip().lower()
+                        alt = input(
+                            f"  Continuar em modo PAPER? ({C['yellow']}s{R}/{C['red']}n{R}): "
+                        ).strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         raise SystemExit(0)
                     if alt == "s":
@@ -531,7 +758,9 @@ def ask_trading_mode() -> TradingMode:
                     print(f"  {C['yellow']}⚠  Saldo baixo.{R}")
 
             try:
-                confirm = input(f"  Confirmas? (escreve {C['red']}REAL{R} para confirmar): ").strip()
+                confirm = input(
+                    f"  Confirmas? (escreve {C['red']}REAL{R} para confirmar): "
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 raise SystemExit(0)
 
@@ -547,6 +776,11 @@ def ask_trading_mode() -> TradingMode:
 
 def confirm_real_order(bet: dict) -> bool:
     phase_str = f" [{bet.get('phase', '')}]" if bet.get('phase') else ""
+    stop_str  = ""
+    if bet.get("stop_loss_active") and bet.get("stop_loss_trigger"):
+        stop_str = (f"\n    Stop-loss : temp >= {bet['stop_loss_trigger']:.0f}°C "
+                    f"(tecto {bet['bracket_temp_hi']:.0f}°C + {STOP_LOSS_DEGREES:.0f}°C)")
+
     print(f"\n  {C['red']}{B}{'═'*46}{R}")
     print(f"  {C['red']}{B}  ⚠  CONFIRMAR ORDEM REAL{phase_str}  ⚠{R}")
     print(f"  {C['red']}{B}{'═'*46}{R}")
@@ -555,6 +789,8 @@ def confirm_real_order(bet: dict) -> bool:
     print(f"    Aposta  : ${bet['bet_size']:.2f}  ({bet['shares']:.2f} shares YES)")
     print(f"    Max prof: +${bet['max_profit']:.2f}")
     print(f"    EV      : {bet['ev_cents']:+.1f}¢/share   edge: {bet['edge_pct']:+.1f}%")
+    if stop_str:
+        print(f"  {C['yellow']}{stop_str.strip()}{R}")
     print(f"  {C['red']}{B}{'─'*46}{R}")
     try:
         ans = input(f"  Enviar ordem? ({C['green']}y{R}/{C['red']}n{R}): ").strip().lower()
@@ -579,7 +815,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "  Obtem em: https://www.wunderground.com/member/api-keys"
         )
 
-    # Em modo headless (VPS), nao perguntar — usar REAL se POLY_PRIVATE_KEY definida
     if headless:
         trading_mode = TradingMode.REAL if POLY_PRIVATE_KEY else TradingMode.PAPER
         mode_str = "REAL" if trading_mode == TradingMode.REAL else "PAPER"
@@ -588,7 +823,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
         trading_mode = ask_trading_mode()
     tg = TG()
 
-    # ── CLOB client ───────────────────────────────────
     clob = None
     if trading_mode == TradingMode.REAL and not POLY_PRIVATE_KEY:
         raise ValueError("POLY_PRIVATE_KEY nao definida. Impossivel usar modo REAL.")
@@ -609,7 +843,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
     else:
         print(f"  {DIM}POLY_PRIVATE_KEY nao definida — modo PAPER sem order book CLOB.{R}")
 
-    # ── OrderExecutor ─────────────────────────────────
     executor = None
     if POLY_PRIVATE_KEY:
         print(f"  {DIM}A inicializar OrderExecutor...{R}", end=" ", flush=True)
@@ -632,20 +865,21 @@ def run(wu_key: str, threshold: float, bankroll: float,
             print(f"  {C['yellow']}⚠  Saldo indisponivel — a usar bankroll do argumento (${bankroll:.2f}){R}")
 
     print(f"\n{B}{C['cyan']}── Munich Live Bot ──────────────────────────────{R}")
-    mode_label = f"{C['yellow']}PAPER{R}" if trading_mode == TradingMode.PAPER else f"{C['red']}REAL{R}"
-    print(f"  Modo      : {mode_label}")
-    print(f"  Threshold : {threshold*100:.0f}%   Min edge: {min_edge}%")
-    print(f"  Estrategia: {B}3 Fases${R} (${BET_SIZE_PER_PHASE:.2f} cada = ${BET_SIZE_PER_PHASE*3:.2f} max/dia)")
-    print(f"  Filtros   : Dupla Condicao (Modelo + Mercado Edge 10¢-90¢)")
+    mode_label = (f"{C['yellow']}PAPER{R}" if trading_mode == TradingMode.PAPER
+                  else f"{C['red']}REAL{R}")
+    print(f"  Modo        : {mode_label}")
+    print(f"  Threshold   : {threshold*100:.0f}%   Min edge: {min_edge}%")
+    print(f"  Estrategia  : {B}3 Fases${R} (${BET_SIZE_PER_PHASE:.2f} cada = ${BET_SIZE_PER_PHASE*3:.2f} max/dia)")
+    print(f"  Stop-Loss   : {C['yellow']}bracket +{STOP_LOSS_DEGREES:.0f}°C → venda auto ao bid{R}")
+    print(f"  Filtros     : Dupla Condicao (Modelo + Mercado Edge 10¢-90¢)")
     if trading_mode == TradingMode.REAL:
-        print(f"  Bankroll  : {C['green']}{B}${bankroll:.2f} USDC{R}  {DIM}(saldo real){R}")
-        print(f"  Stop-loss : ${POLY_MAX_DAILY_LOSS:.0f} USDC/dia")
+        print(f"  Bankroll    : {C['green']}{B}${bankroll:.2f} USDC{R}  {DIM}(saldo real){R}")
+        print(f"  Stop diario : ${POLY_MAX_DAILY_LOSS:.0f} USDC")
     else:
-        print(f"  Bankroll  : ${bankroll:.2f}  {DIM}(simulado){R}")
-    print(f"  Intervalo : {interval}s  |  Fast-poll nas janelas :18-:32 e :45-:55 (Berlin)")
+        print(f"  Bankroll    : ${bankroll:.2f}  {DIM}(simulado){R}")
+    print(f"  Intervalo   : {interval}s  |  Fast-poll :18-:32 e :45-:55 (Berlin)")
     print()
 
-    # ── Carregar modelo ───────────────────────────────
     print("[1/4] A carregar modelo...")
     model, feat_cols, prior_map, monthly_threshold = load_model()
     set_seasonal_prior(prior_map)
@@ -653,7 +887,6 @@ def run(wu_key: str, threshold: float, bankroll: float,
     def get_threshold(month: int) -> float:
         return monthly_threshold.get(month, threshold) if monthly_threshold else threshold
 
-    # ── Bootstrap ─────────────────────────────────────
     print(f"\n[2/4] Bootstrap — historico de hoje...")
     series_today, slots_so_far = bootstrap_today(wu_key, wu_sess)
     obs_min_today = dict(getattr(bootstrap_today, "_obs_min", {}))
@@ -683,7 +916,8 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "humidity":        slot.get("humidity", 70),
             "prev_7d_avg_max": compute_prev7(history_max, today),
         }
-        p_i = predict_p(model, feat_cols, slots_so_far[:i+1], current_extra, month, doy)
+        p_i = predict_p(model, feat_cols, slots_so_far[:i+1],
+                        current_extra, month, doy)
         signals[(h, s)] = p_i
 
     peak_detected = any(pv >= get_threshold(month) for pv in signals.values())
@@ -695,11 +929,13 @@ def run(wu_key: str, threshold: float, bankroll: float,
     if market and clob:
         market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
 
-    usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY) if (trading_mode == TradingMode.REAL and POLY_PRIVATE_KEY) else None
-    open_orders  = executor.get_open_orders() if (trading_mode == TradingMode.REAL and executor) else None
+    usdc_balance = (get_real_usdc_balance(POLY_PRIVATE_KEY)
+                    if (trading_mode == TradingMode.REAL and POLY_PRIVATE_KEY) else None)
+    open_orders  = (executor.get_open_orders()
+                    if (trading_mode == TradingMode.REAL and executor) else None)
 
-    clob_mode_str   = "real" if trading_mode == TradingMode.REAL else "paper"
-    threshold_month = get_threshold(today.month)
+    clob_mode_str    = "real" if trading_mode == TradingMode.REAL else "paper"
+    threshold_month  = get_threshold(today.month)
 
     tg.alert_started(
         mode            = clob_mode_str,
@@ -731,15 +967,22 @@ def run(wu_key: str, threshold: float, bankroll: float,
             "minute":      last["slot30"],
         }
 
-    # ── ESTADO DE FASES (Substitui o antigo bet_placed) ──
+    # ── ESTADO DE FASES ────────────────────────────────
     phases_done: BetPhase = BetPhase.NONE
-    bets: list  = []
+    bets: list            = []
+
+    # Posições abertas (para stop-loss tracking)
+    # dict: BetPhase → BracketPosition
+    open_positions: dict[BetPhase, BracketPosition] = {}
+
+    # PnL do dia (stop-losses realizados)
+    realized_pnl_today: float = 0.0
 
     try:
         while True:
             now = local_now()
 
-            # Novo dia (Berlin) — corre a qualquer hora, incluindo madrugada
+            # ── Novo dia ─────────────────────────────
             station_date = berlin_date()
             if station_date != today:
                 today         = station_date
@@ -751,15 +994,16 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 cloud_by_hour = {}
                 signals       = {}
                 peak_detected = False
-                phases_done   = BetPhase.NONE  # Reset das 3 fases
+                phases_done   = BetPhase.NONE
                 bets          = []
+                open_positions      = {}
+                realized_pnl_today  = 0.0
                 log_path      = LOG_DIR / f"live_{today}.csv"
                 bets_path     = LOG_DIR / f"bets_{today}.json"
                 month         = today.month
                 doy           = today.timetuple().tm_yday
                 latest_obs    = None
 
-                # Tentar obter mercado com retry
                 market = None
                 for _attempt in range(3):
                     market = fetch_market(market_date)
@@ -774,10 +1018,11 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     cloud_by_hour = cloud_from_series(series_today, rows_cache)
                     temps_by_hour = {s["hour"]: s["temp_c"] for s in slots_so_far}
                 except Exception as _e:
-                    print(f"  {C['yellow']}Bootstrap falhou: {_e} — a retomar no proximo tick{R}")
+                    print(f"  {C['yellow']}Bootstrap falhou: {_e}{R}")
 
                 if market and clob:
-                    market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
+                    market["brackets"] = [clob.enrich_bracket(b)
+                                          for b in market["brackets"]]
 
                 update_history_max(history_max, slots_so_far)
 
@@ -791,7 +1036,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     today           = today,
                 )
 
-            # ── Ultima leitura WU ──────────────────────
+            # ── Ultima leitura WU ─────────────────────
             new_obs = fetch_wu_latest(wu_key, wu_sess)
             if new_obs:
                 latest_obs = new_obs
@@ -823,6 +1068,38 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
             update_history_max(history_max, slots_so_far)
 
+            # ── Temperatura actual ────────────────────
+            current_temp = latest_obs["temp_c"] if latest_obs else 0.0
+
+            # ══════════════════════════════════════════
+            #  CHECK STOP-LOSS em todas as posições abertas
+            # ══════════════════════════════════════════
+            for phase_key, pos in list(open_positions.items()):
+                if pos.stopped_out:
+                    continue
+                just_triggered = pos.check_and_trigger(current_temp)
+                if just_triggered:
+                    sl_result = execute_stop_loss(
+                        position     = pos,
+                        clob         = clob,
+                        executor     = executor,
+                        trading_mode = trading_mode,
+                        tg           = tg,
+                        current_temp = current_temp,
+                    )
+                    if sl_result["success"]:
+                        realized_pnl_today += sl_result["pnl_usdc"]
+                        # Actualizar o registo da aposta com info do stop
+                        for bet in bets:
+                            if (bet.get("phase") == pos.phase.name
+                                    and bet.get("bracket") == pos.label):
+                                bet["stop_loss_executed"] = True
+                                bet["stop_loss_exit"]     = sl_result["exit_price"]
+                                bet["stop_loss_pnl"]      = sl_result["pnl_usdc"]
+                                break
+                        bets_path.write_text(
+                            json.dumps(bets, indent=2, default=str))
+
             # ── Calcular P ────────────────────────────
             h_now  = berlin_now().hour
             m_now  = berlin_now().minute
@@ -837,10 +1114,11 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     "humidity":        latest_obs.get("humidity", 70) if latest_obs else 70,
                     "prev_7d_avg_max": compute_prev7(history_max, today),
                 }
-                p = predict_p(model, feat_cols, slots_so_far, current_extra, month, doy)
+                p = predict_p(model, feat_cols, slots_so_far,
+                              current_extra, month, doy)
                 signals[(h_cur, s30_cur)] = p
 
-            # ── Detectar pico (transicao irreversivel) ──
+            # ── Detectar pico ─────────────────────────
             if p >= get_threshold(month) and not peak_detected:
                 peak_detected = True
                 if series_today:
@@ -856,24 +1134,25 @@ def run(wu_key: str, threshold: float, bankroll: float,
             if not (phases_done & BetPhase.GREEN) and tg.zone_changed(p):
                 tg.alert_zone_change(p, tg.p_zone(p))
 
-            # ── Actualizar mercado + forecast periodicamente ──
+            # ── Actualizar mercado + forecast ─────────
             if now.minute % 10 == 0 or not market:
                 market = fetch_market(market_date)
                 if market and clob:
-                    market["brackets"] = [clob.enrich_bracket(b) for b in market["brackets"]]
+                    market["brackets"] = [clob.enrich_bracket(b)
+                                          for b in market["brackets"]]
             if now.minute % 30 == 0 or forecast_max is None:
                 forecast_max = fetch_wu_forecast_max(wu_key, wu_sess)
 
-            # ── Label da janela de sinal ──────────────
             berlin_min = berlin_now().minute
             signal_window_label = ""
-            in_signal_window = any(lo <= berlin_min <= hi for lo, hi in _SIGNAL_CHECK_WINDOWS)
+            in_signal_window = any(lo <= berlin_min <= hi
+                                   for lo, hi in _SIGNAL_CHECK_WINDOWS)
             if in_signal_window:
-                signal_window_label = (f"  {C['cyan']}◉ a verificar sinal (:20){R}"
-                                       if 18 <= berlin_min <= 32 else
-                                       f"  {C['cyan']}◉ a verificar sinal (:50){R}")
+                signal_window_label = (
+                    f"  {C['cyan']}◉ a verificar sinal (:20){R}"
+                    if 18 <= berlin_min <= 32 else
+                    f"  {C['cyan']}◉ a verificar sinal (:50){R}")
 
-            # ── Running max ───────────────────────────
             if series_today:
                 rmax_slot = max(series_today, key=series_today.get)
                 rmax      = series_today[rmax_slot]
@@ -882,24 +1161,20 @@ def run(wu_key: str, threshold: float, bankroll: float,
             else:
                 rmax = 0
 
-            # FIX CRÍTICO: Garantir que bracket_temp tem sempre um valor válido
-            # (No código antigo, se series_today e forecast_max fossem None, dava erro)
             if forecast_max and forecast_max.get("temp_max") is not None:
                 bracket_temp = float(forecast_max["temp_max"])
             elif rmax > 0:
                 bracket_temp = float(rmax)
             else:
-                bracket_temp = 15.0 # Fallback seguro
-                
+                bracket_temp = 15.0
+
             bracket = find_bracket(market, bracket_temp) if market else None
 
-            # ── DUPLA CONDIÇÃO: BUSCA DINÂMICA ─────────
-            # Se o mercado não confirmar o bracket exato (ex: ask a 99.8¢), 
-            # procurar o bracket adjacente com melhor edge.
             if bracket:
                 mkt_ok_exact, _ = market_confirms_bracket(bracket)
                 if not mkt_ok_exact:
-                    bracket = find_best_value_bracket(market, rmax if rmax > 0 else bracket_temp)
+                    bracket = find_best_value_bracket(market, rmax if rmax > 0
+                                                      else bracket_temp)
 
             if bracket and clob and not bracket.get("book"):
                 bracket = clob.enrich_bracket(bracket)
@@ -918,58 +1193,56 @@ def run(wu_key: str, threshold: float, bankroll: float,
             bet_blocked_reason = None
             new_bet_placed     = False
 
-            # 1. Validar Mercado (aplica a todas as fases)
             mkt_ok, mkt_reason = market_confirms_bracket(bracket)
 
-            # Stop-loss bloqueia tudo
             if trading_mode == TradingMode.REAL and clob and clob.stop_loss_triggered():
-                bet_blocked_reason = (f"stop-loss diario atingido "
-                                     f"(${clob.daily_loss():.2f} >= ${POLY_MAX_DAILY_LOSS:.0f})")
+                bet_blocked_reason = (
+                    f"stop-loss diario atingido "
+                    f"(${clob.daily_loss():.2f} >= ${POLY_MAX_DAILY_LOSS:.0f})")
             elif not market:
                 bet_blocked_reason = "sem mercado Polymarket"
             elif not bracket:
                 bet_blocked_reason = "bracket nao identificado"
             elif phases_done == BetPhase.DONE:
-                pass # Silencioso, dia completo
+                pass
             else:
-                # 2. Verificar Triggers (Modelo) + Condição de Mercado
                 berlin_h = berlin_now().hour
                 berlin_m = berlin_now().minute
-                
-                phase_to_execute = None
-                phase_label = ""
-                phase_name = ""
 
-                # Prioridade: VERDE > AMARELO > INICIAL (para não saltar fases)
+                phase_to_execute = None
+                phase_label      = ""
+                phase_name       = ""
+
                 if not (phases_done & BetPhase.GREEN) and p >= 0.80 and mkt_ok:
                     phase_to_execute = BetPhase.GREEN
-                    phase_label = f"{C['green']}VERDE (P>80%){R}"
-                    phase_name = "GREEN"
+                    phase_label      = f"{C['green']}VERDE (P>80%){R}"
+                    phase_name       = "GREEN"
                 elif not (phases_done & BetPhase.YELLOW) and p >= 0.60 and mkt_ok:
                     phase_to_execute = BetPhase.YELLOW
-                    phase_label = f"{C['yellow']}AMARELO (P>60%){R}"
-                    phase_name = "YELLOW"
+                    phase_label      = f"{C['yellow']}AMARELO (P>60%){R}"
+                    phase_name       = "YELLOW"
                 elif not (phases_done & BetPhase.INITIAL) and berlin_h >= 10 and mkt_ok:
                     phase_to_execute = BetPhase.INITIAL
-                    phase_label = f"{C['cyan']}INICIAL (10:00){R}"
-                    phase_name = "INITIAL"
+                    phase_label      = f"{C['cyan']}INICIAL (10:00){R}"
+                    phase_name       = "INITIAL"
 
                 if phase_to_execute is None:
-                    # Determinar a razão exata do bloqueio para o dashboard
                     if not mkt_ok:
                         bet_blocked_reason = f"MERCADO RECUSA: {mkt_reason}"
                     elif not (phases_done & BetPhase.INITIAL) and berlin_h < 10:
-                        bet_blocked_reason = f"aguardar 10:00 Berlin (agora {berlin_h}:{berlin_m:02d})"
+                        bet_blocked_reason = (f"aguardar 10:00 Berlin "
+                                              f"(agora {berlin_h}:{berlin_m:02d})")
                     elif not (phases_done & BetPhase.GREEN) and p < 0.80:
-                        bet_blocked_reason = f"aguardar zona verde (P={p*100:.0f}% < 80%)"
+                        bet_blocked_reason = (f"aguardar zona verde "
+                                              f"(P={p*100:.0f}% < 80%)")
                     elif not (phases_done & BetPhase.YELLOW) and p < 0.60:
-                        bet_blocked_reason = f"aguardar zona amarela (P={p*100:.0f}% < 60%)"
+                        bet_blocked_reason = (f"aguardar zona amarela "
+                                              f"(P={p*100:.0f}% < 60%)")
                 else:
-                    # 3. EXECUTAR APOSTA DA FASE
                     bet_record = build_bet_record(
-                        bracket, p, ev, bankroll, kelly_frac, trading_mode, 
+                        bracket, p, ev, bankroll, kelly_frac, trading_mode,
                         max_daily_loss=POLY_MAX_DAILY_LOSS,
-                        phase_name=phase_name
+                        phase_name=phase_name,
                     )
 
                     if trading_mode == TradingMode.PAPER:
@@ -982,8 +1255,26 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         bet_record["order_id"] = result["order_id"]
                         bet_record["status"]   = result["status"]
                         bet        = bet_record
-                        phases_done |= phase_to_execute
-                        new_bet_placed = True
+                        phases_done         |= phase_to_execute
+                        new_bet_placed       = True
+
+                        # Registar posição aberta para stop-loss
+                        open_positions[phase_to_execute] = BracketPosition(
+                            phase_to_execute, bracket, bet_record)
+
+                        # Info do stop-loss no terminal
+                        ceiling = bracket_ceiling(bracket)
+                        if ceiling is not None:
+                            print(
+                                f"\n  {C['cyan']}ℹ  Stop-loss activo:{R} "
+                                f"se temp >= {ceiling + STOP_LOSS_DEGREES:.0f}°C "
+                                f"(tecto {ceiling:.0f}°C + {STOP_LOSS_DEGREES:.0f}°C)"
+                            )
+                        else:
+                            print(
+                                f"\n  {C['cyan']}ℹ  Bracket 'or higher' — "
+                                f"sem stop-loss por subida{R}"
+                            )
 
                     else:
                         _do_order = headless or confirm_real_order(bet_record)
@@ -1001,13 +1292,30 @@ def run(wu_key: str, threshold: float, bankroll: float,
                                     bet_record["order_id"] = result["order_id"]
                                     bet_record["status"]   = result["status"]
                                     bet        = bet_record
-                                    phases_done |= phase_to_execute
-                                    new_bet_placed = True
+                                    phases_done         |= phase_to_execute
+                                    new_bet_placed       = True
+
+                                    # Registar posição
+                                    open_positions[phase_to_execute] = BracketPosition(
+                                        phase_to_execute, bracket, bet_record)
+
                                     usdc_balance = get_real_usdc_balance(POLY_PRIVATE_KEY)
-                                    open_orders  = executor.get_open_orders() if executor else None
-                                    print(f"\n  {C['green']}✓ Ordem {phase_label} enviada — "
-                                          f"ID: {result['order_id']}{R}")
+                                    open_orders  = (executor.get_open_orders()
+                                                    if executor else None)
+                                    print(
+                                        f"\n  {C['green']}✓ Ordem {phase_label} enviada — "
+                                        f"ID: {result['order_id']}{R}"
+                                    )
                                     tg.alert_order_placed(bet_record)
+
+                                    # Info do stop-loss
+                                    ceiling = bracket_ceiling(bracket)
+                                    if ceiling is not None:
+                                        print(
+                                            f"  {C['yellow']}Stop-loss:{R} "
+                                            f"activo se temp >= "
+                                            f"{ceiling + STOP_LOSS_DEGREES:.0f}°C"
+                                        )
                                 else:
                                     bet_blocked_reason = f"Ordem falhou: {result['error']}"
                                     print(f"\n  {C['red']}✗ Falha na ordem: {result['error']}{R}")
@@ -1017,11 +1325,12 @@ def run(wu_key: str, threshold: float, bankroll: float,
 
                     if bet:
                         bets.append(bet)
-                        bets_path.write_text(json.dumps(bets, indent=2, default=str))
+                        bets_path.write_text(
+                            json.dumps(bets, indent=2, default=str))
                         if trading_mode == TradingMode.PAPER:
                             tg.alert_order_placed(bet)
 
-            # ── Sinais por hora para o dashboard ──────
+            # ── Sinais por hora ───────────────────────
             signals_by_hour: dict[int, float] = {}
             for (sh, ss), sp in signals.items():
                 if sh not in signals_by_hour or sp > signals_by_hour[sh]:
@@ -1032,25 +1341,39 @@ def run(wu_key: str, threshold: float, bankroll: float,
             if clob:
                 clob.positions.refresh(clob)
 
+            # ── Info das posições com stop-loss (para display) ─
+            # Passa informação adicional sobre posições abertas e stops
+            stop_loss_info = {}
+            for phase_key, pos in open_positions.items():
+                if not pos.stopped_out:
+                    ceiling = pos.ceiling
+                    if ceiling is not None:
+                        stop_loss_info[pos.phase.name] = {
+                            "bracket":  pos.label,
+                            "ceiling":  ceiling,
+                            "trigger":  ceiling + STOP_LOSS_DEGREES,
+                            "distance": (ceiling + STOP_LOSS_DEGREES) - current_temp,
+                        }
+
             display(
                 now, latest_obs, temps_by_hour, series_today, signals_by_hour, p,
                 market, bracket, ev, bet,
                 len(series_today), bankroll, threshold_month, peak_detected,
-                trading_mode       = trading_mode,
-                daily_loss         = clob.daily_loss() if clob else 0.0,
-                max_daily_loss     = POLY_MAX_DAILY_LOSS,
-                usdc_balance       = usdc_balance,
-                positions          = clob.positions if clob else None,
-                bet_blocked_reason = bet_blocked_reason,
-                bet_placed         = new_bet_placed,
-                forecast_max       = forecast_max,
-                berlin_now_dt      = berlin_now(),
-                market_date        = market_date,
-                executor           = executor,
-                open_orders        = open_orders,
-                signal_window_label= signal_window_label,
-                obs_min_today      = obs_min_today,
-                phases_done        = phases_done,
+                trading_mode        = trading_mode,
+                daily_loss          = clob.daily_loss() if clob else 0.0,
+                max_daily_loss      = POLY_MAX_DAILY_LOSS,
+                usdc_balance        = usdc_balance,
+                positions           = clob.positions if clob else None,
+                bet_blocked_reason  = bet_blocked_reason,
+                bet_placed          = new_bet_placed,
+                forecast_max        = forecast_max,
+                berlin_now_dt       = berlin_now(),
+                market_date         = market_date,
+                executor            = executor,
+                open_orders         = open_orders,
+                signal_window_label = signal_window_label,
+                obs_min_today       = obs_min_today,
+                phases_done         = phases_done,
             )
 
             log_tick(
@@ -1059,7 +1382,7 @@ def run(wu_key: str, threshold: float, bankroll: float,
                 bet_blocked_reason = bet_blocked_reason if not new_bet_placed else None,
             )
 
-            # ── Override manual ('f' + Enter) ─────────
+            # ── Override manual ('f' + Enter) ──────────
             stop_loss_hit = (trading_mode == TradingMode.REAL
                              and clob is not None
                              and clob.stop_loss_triggered())
@@ -1082,24 +1405,26 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     )
                     if forced_bet:
                         bets.append(forced_bet)
-                        bets_path.write_text(json.dumps(bets, indent=2, default=str))
-                        print(f"\n  {C['yellow']}{B}◈  Entrada forcada registada — "
-                              f"{forced_bet['bracket']}  ${forced_bet['bet_size']:.2f}{R}\n")
+                        bets_path.write_text(
+                            json.dumps(bets, indent=2, default=str))
+                        print(
+                            f"\n  {C['yellow']}{B}◈  Entrada forcada — "
+                            f"{forced_bet['bracket']}  ${forced_bet['bet_size']:.2f}{R}\n"
+                        )
                         time.sleep(2)
                     elif forced_err:
                         print(f"\n  {C['red']}✗ Entrada forcada cancelada: {forced_err}{R}\n")
                         time.sleep(1)
 
-            # ── Smart sleep (fast-poll nas janelas EDDM) ──────────────────
+            # ── Smart sleep ───────────────────────────
             _berlin_h = berlin_now().hour
             _last_t   = latest_obs["temp_c"] if latest_obs else None
             if _berlin_h < 8 or _berlin_h >= 21:
-                time.sleep(300)   # 5 min de madrugada
+                time.sleep(300)
             else:
                 smart_sleep(interval, wu_key, wu_sess, _last_t)
 
-            # ── Dashboard periodica Telegram (30 min) ─────────────────────
-                        # ── Dashboard periodica Telegram (30 min) ─────────────────────
+            # ── Dashboard Telegram (30 min) ────────────
             if time.time() - _tg_last_dashboard >= _tg_dashboard_interval:
                 _tg_last_dashboard = time.time()
                 _rmax_ts = "?"
@@ -1107,49 +1432,79 @@ def run(wu_key: str, threshold: float, bankroll: float,
                     _rs  = max(series_today, key=series_today.get)
                     _obs = (obs_min_today or {}).get(_rs)
                     _rmax_ts = f"{_obs[0]}:{_obs[1]:02d}" if _obs else f"{_rs[0]}h"
-                
-                # Recolher dados extras para o TG
+
                 _tg_open_pos = []
-                _tg_summary = None
+                _tg_summary  = None
                 if clob and clob.positions:
                     _tg_open_pos = clob.positions.open_positions()
-                    _tg_summary = clob.positions.pnl_summary()
+                    _tg_summary  = clob.positions.pnl_summary()
+
+                # Incluir info de stop-losses no dashboard TG
+                stop_info_str = ""
+                if stop_loss_info:
+                    lines = []
+                    for phase_n, info in stop_loss_info.items():
+                        lines.append(
+                            f"  [{phase_n}] {info['bracket']} "
+                            f"trigger@{info['trigger']:.0f}°C "
+                            f"(dist {info['distance']:+.1f}°C)")
+                    stop_info_str = "\n".join(lines)
 
                 tg.dashboard(
-                    today         = today,
-                    p             = p,
-                    rmax          = rmax,
-                    rmax_time     = _rmax_ts,
-                    temp_now      = latest_obs["temp_c"] if latest_obs else None,
-                    forecast_max  = forecast_max,
-                    market        = market,
-                    bracket       = bracket,
-                    ev            = ev,
-                    peak_detected = peak_detected,
-                    bet           = bets[-1] if bets else None,
-                    clob_mode     = clob_mode_str,
-                    reason        = "periodic",
-                    open_positions = _tg_open_pos,
+                    today             = today,
+                    p                 = p,
+                    rmax              = rmax,
+                    rmax_time         = _rmax_ts,
+                    temp_now          = latest_obs["temp_c"] if latest_obs else None,
+                    forecast_max      = forecast_max,
+                    market            = market,
+                    bracket           = bracket,
+                    ev                = ev,
+                    peak_detected     = peak_detected,
+                    bet               = bets[-1] if bets else None,
+                    clob_mode         = clob_mode_str,
+                    reason            = "periodic",
+                    open_positions    = _tg_open_pos,
                     positions_summary = _tg_summary,
-                    usdc_balance  = usdc_balance,
-                    phases_done   = phases_done,
-                    bet_blocked_reason = bet_blocked_reason,
+                    usdc_balance      = usdc_balance,
+                    phases_done       = phases_done,
+                    bet_blocked_reason= bet_blocked_reason,
                 )
 
     except KeyboardInterrupt:
         print(f"\n\n  {DIM}Stopped.  Logs em ./{LOG_DIR}/{R}")
+
+        # Resumo de PnL do dia
+        if bets or realized_pnl_today != 0:
+            print(f"\n  {B}── Resumo do Dia ───────────────────────────{R}")
+            n_stops_today = sum(
+                1 for pos in open_positions.values() if pos.stopped_out)
+            if n_stops_today:
+                print(f"  Stop-losses executados : {C['yellow']}{n_stops_today}{R}")
+            print(f"  PnL realizado (stops)  : "
+                  f"{'+' if realized_pnl_today >= 0 else ''}"
+                  f"{C['green'] if realized_pnl_today >= 0 else C['red']}"
+                  f"${realized_pnl_today:.2f}{R}")
+
         tg.alert_stopped(bets, clob_mode_str)
         if bets:
-            mode_label = "simuladas" if trading_mode == TradingMode.PAPER else "reais"
-            print(f"  {C['green']}{len(bets)} ordens {mode_label} → {bets_path}{R}")
+            mode_label_str = ("simuladas" if trading_mode == TradingMode.PAPER
+                              else "reais")
+            print(f"  {C['green']}{len(bets)} ordens {mode_label_str} → {bets_path}{R}")
 
         if clob:
             today_pos = clob.positions.today_position()
             if today_pos and today_pos.status.value == "open":
-                print(f"\n  {C['yellow']}Tens uma posicao aberta: {today_pos.bracket_label}  "
-                      f"entrada {today_pos.entry_ask*100:.1f}¢{R}")
+                print(
+                    f"\n  {C['yellow']}Tens uma posicao aberta: "
+                    f"{today_pos.bracket_label}  "
+                    f"entrada {today_pos.entry_ask*100:.1f}¢{R}"
+                )
                 try:
-                    ans = input(f"  Fechar posicao ao bid actual? ({C['green']}y{R}/{C['red']}n{R}): ").strip().lower()
+                    ans = input(
+                        f"  Fechar posicao ao bid actual? "
+                        f"({C['green']}y{R}/{C['red']}n{R}): "
+                    ).strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     ans = "n"
                 if ans == "y":
@@ -1160,12 +1515,14 @@ def run(wu_key: str, threshold: float, bankroll: float,
                         if result.success:
                             pnl  = today_pos.pnl_usd or 0
                             sign = "+" if pnl >= 0 else ""
-                            print(f"  {C['green']}✓ Posicao fechada a {bid*100:.1f}¢  "
-                                  f"P&L: {sign}${pnl:.2f}{R}")
+                            print(
+                                f"  {C['green']}✓ Posicao fechada a "
+                                f"{bid*100:.1f}¢  P&L: {sign}${pnl:.2f}{R}"
+                            )
                         else:
                             print(f"  {C['red']}✗ Falha ao fechar: {result.error}{R}")
                     else:
-                        print(f"  {C['red']}Bid nao disponivel — posicao mantida aberta.{R}")
+                        print(f"  {C['red']}Bid nao disponivel.{R}")
 
 
 # ══════════════════════════════════════════════════════
@@ -1175,15 +1532,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Munich Max Temp — Live Bot (WU + Polymarket + LightGBM)"
     )
-    parser.add_argument("--threshold",     type=float, default=0.46)
-    parser.add_argument("--bankroll",      type=float, default=200.0)
-    parser.add_argument("--kelly",         type=float, default=0.5)
-    parser.add_argument("--min-edge",      type=float, default=5.0)
-    parser.add_argument("--interval",      type=int,   default=60)
-    parser.add_argument("--max-daily-loss",type=float, default=50.0,
+    parser.add_argument("--threshold",      type=float, default=0.46)
+    parser.add_argument("--bankroll",       type=float, default=200.0)
+    parser.add_argument("--kelly",          type=float, default=0.5)
+    parser.add_argument("--min-edge",       type=float, default=5.0)
+    parser.add_argument("--interval",       type=int,   default=60)
+    parser.add_argument("--max-daily-loss", type=float, default=50.0,
                         help="Maxima perda aceite por dia em USDC (default: 50)")
-    parser.add_argument("--yes", "-y", action="store_true",
-                        help="Modo headless: nao pede confirmacao manual de ordens REAL")
+    parser.add_argument("--yes", "-y",      action="store_true",
+                        help="Modo headless: sem confirmacao manual")
     args = parser.parse_args()
 
     run(
