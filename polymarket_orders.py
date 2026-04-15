@@ -367,28 +367,22 @@ class OrderExecutor:
         """Obtém o saldo USDC no CLOB (prioriza sig_type=2)"""
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         try:
-            # Priorizar sig_type=2 (onde o saldo realmente está)
-            info = self._client.get_balance_allowance(
-                params=BalanceAllowanceParams(
-                    asset_type=AssetType.COLLATERAL,
-                    signature_type=2
-                )
-            )
-            bal = int(info.get("balance", 0)) / 1e6
-            if bal > 0:
-                return bal
-            
-            # Fallback para outros tipos
-            for sig in [1, 0]:
+            # PRIORIDADE: sig_type=2 primeiro (onde o saldo REAL está)
+            for sig in [2, 1, 0]:
                 try:
                     info = self._client.get_balance_allowance(
-                        params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig)
+                        params=BalanceAllowanceParams(
+                            asset_type=AssetType.COLLATERAL,
+                            signature_type=sig
+                        )
                     )
                     bal = int(info.get("balance", 0)) / 1e6
                     if bal > 0:
+                        logger.debug(f"✅ Saldo encontrado em sig_type={sig}: ${bal:.2f}")
                         return bal
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"sig_type={sig} falhou: {e}")
+                    continue
             return 0.0
         except Exception as e:
             logger.error(f"Erro get_balance: {e}")
@@ -443,6 +437,8 @@ class OrderExecutor:
         
         # Verificar saldo antes de comprar
         current_bal = self.get_balance()
+        logger.info(f"💰 Saldo atual antes da compra: ${current_bal:.2f}")
+        
         if current_bal is not None and current_bal < size_usdc:
             error_msg = f"Saldo CLOB insuficiente: ${current_bal:.2f} < ${size_usdc:.2f}"
             logger.error(error_msg)
