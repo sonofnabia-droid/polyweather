@@ -1,5 +1,5 @@
 """
-munich_config.py
+munich_config.py  - BRANCH - main
 ================
 Constantes globais, helpers de timezone, ANSI e janelas de sinal WU.
 Importado por todos os outros modulos — sem dependencias externas
