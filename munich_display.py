@@ -1,5 +1,5 @@
 # munich_display.py — V3 com risk-first, ensemble breakdown, 3 parcelas e dual forecast - BRANCH - INTEGRATION
- 
+ # BRANCH - INTEGRATION
 import csv
 import os
 import shutil
