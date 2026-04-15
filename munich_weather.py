@@ -1,5 +1,5 @@
 """
-munich_weather.py
+munich_weather.py  - BRANCH - INTEGRATION
 =================
 Acesso a dados meteorologicos via WU EDDM + Open-Meteo.
 
