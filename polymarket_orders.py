@@ -136,6 +136,7 @@ class OrderExecutor:
     """
     Executa ordens no Polymarket CLOB.
     Verifica e garante allowance onchain antes de qualquer ordem.
+    Tenta depositar fundos automaticamente se o saldo no CLOB for 0.
     """
 
     def __init__(self, private_key: str):
@@ -191,8 +192,6 @@ class OrderExecutor:
             logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
 
         # ── Garantir allowance onchain ─────────────────────────────────────
-        # O erro "balance: 0" no CLOB significa allowance onchain = 0.
-        # Verificamos directamente no contrato USDC via Web3 (mais fiável que a API).
         try:
             allowance = _check_allowance_web3(self._key)
             if allowance < 0:
@@ -217,7 +216,94 @@ class OrderExecutor:
         except Exception as e:
             logger.warning("Verificação de allowance falhou: %s", e)
 
+        # ── Verificar e Depositar Saldo no CLOB ─────────────────────────────
+        # O erro "balance: 0" acontece quando tens USDC na carteira mas não no balanço do CLOB.
+        time.sleep(2) 
+        
+        clob_balance = self.get_balance()
+        
+        # Se o saldo no CLOB for 0 ou muito baixo, tentamos depositar da Wallet Principal
+        if clob_balance is not None and clob_balance < 1.0:
+            logger.warning(
+                "Saldo no CLOB baixo (%.2f USDC). A tentar depositar $20.00 da wallet...", 
+                clob_balance
+            )
+            # Tenta depositar $20 para garantir margem para operar
+            deposit_ok = self.deposit_usdc(20.0) 
+            if deposit_ok:
+                time.sleep(5) # Esperar confirmação na API
+                new_balance = self.get_balance()
+                logger.info("✓ Depósito realizado. Novo saldo CLOB: %.2f USDC", new_balance or 0)
+            else:
+                logger.error("✗ Falha no depósito. O bot não conseguirá negociar.")
+        elif clob_balance is None:
+            logger.warning("Não foi possível verificar saldo CLOB. A assumir que está OK.")
+
         return client
+
+    # ── Depósito de Fundos (NOVO) ─────────────────────────────
+
+    def deposit_usdc(self, amount_usdc: float) -> bool:
+        """
+        Move USDC da wallet principal para o endereço do Exchange CLOB.
+        Necessário para resolver o erro "balance: 0" quando tens fundos na carteira
+        mas a API do CLOB não os vê.
+        """
+        from web3 import Web3
+        from eth_account import Account
+
+        ABI_TRANSFER = [{
+            "name": "transfer",
+            "type": "function",
+            "inputs": [
+                {"name": "to",   "type": "address"},
+                {"name": "value","type": "uint256"},
+            ],
+            "outputs": [{"name": "", "type": "bool"}],
+            "stateMutability": "nonpayable",
+        }]
+
+        account = Account.from_key(self._key)
+        to_addr = Web3.to_checksum_address(EXCHANGE_ADDRESS) # Enviar para o contrato do Exchange
+        usdc    = Web3.to_checksum_address(USDC_ADDRESS)
+        amount_raw = int(amount_usdc * 10**6)
+
+        for rpc in POLYGON_RPCS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+                if not w3.is_connected():
+                    continue
+
+                contract = w3.eth.contract(address=usdc, abi=ABI_TRANSFER)
+                nonce    = w3.eth.get_transaction_count(account.address)
+                gas_price = w3.eth.gas_price
+
+                tx = contract.functions.transfer(to_addr, amount_raw).build_transaction({
+                    "from":     account.address,
+                    "nonce":    nonce,
+                    "gas":      100_000, # Gás suficiente para transfer
+                    "gasPrice": gas_price,
+                    "chainId":  137,
+                })
+
+                signed  = w3.eth.account.sign_transaction(tx, self._key)
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                logger.info("Depósito tx enviada: %s (%.2f USDC)", tx_hash.hex(), amount_usdc)
+
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+                if receipt.status == 1:
+                    logger.info("✓ Depósito confirmado no CLOB (bloco %s)", receipt.blockNumber)
+                    return True
+                else:
+                    logger.error("✗ Depósito falhou onchain (status=0)")
+                    return False
+
+            except Exception as e:
+                logger.debug("Depósito RPC %s falhou: %s", rpc, e)
+                continue
+
+        logger.error("deposit_usdc: todos os RPCs falharam")
+        return False
 
     # ── Saldo ──────────────────────────────────────────
 
@@ -245,7 +331,7 @@ class OrderExecutor:
         except Exception as e:
             logger.debug("get_balance_allowance falhou: %s", e)
 
-        # Fallback Web3
+        # Fallback Web3 (apenas para verificar saldo na carteira, não no CLOB)
         for rpc in POLYGON_RPCS:
             try:
                 from web3 import Web3
