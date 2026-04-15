@@ -1,5 +1,5 @@
 """
-polymarket_clob.py
+polymarket_clob.py  - BRANCH - INTEGRATION
 ==================
 Camada de acesso ao Polymarket CLOB.
 
