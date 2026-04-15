@@ -1,5 +1,5 @@
 """
-polymarket_orders.py ??
+polymarket_orders.py
 ====================
 Execução de ordens no Polymarket CLOB com gestão automática de depósitos.
 Versão corrigida: suporte a chaves com/sem 0x, sig_type=2 prioritário, allowance automático.
@@ -364,29 +364,56 @@ class OrderExecutor:
             return False
 
     def get_balance(self) -> float | None:
-        """Obtém o saldo USDC no CLOB (prioriza sig_type=2)"""
+        """Obtém o saldo USDC no CLOB - PRIORIDADE ABSOLUTA para sig_type=2"""
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         try:
-            # PRIORIDADE: sig_type=2 primeiro (onde o saldo REAL está)
-            for sig in [2, 1, 0]:
+            # FORÇAR sig_type=2 primeiro (onde o saldo REAL está)
+            # De acordo com o check_funds.py, o saldo está em sig_type=2
+            info = self._client.get_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=2
+                )
+            )
+            bal = int(info.get("balance", 0)) / 1e6
+            logger.info(f"💰 Saldo CLOB (sig_type=2): ${bal:.2f}")
+            
+            if bal > 0:
+                return bal
+            
+            # Fallback para outros tipos apenas se necessário
+            for sig in [1, 0]:
                 try:
                     info = self._client.get_balance_allowance(
-                        params=BalanceAllowanceParams(
-                            asset_type=AssetType.COLLATERAL,
-                            signature_type=sig
-                        )
+                        params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=sig)
                     )
                     bal = int(info.get("balance", 0)) / 1e6
                     if bal > 0:
-                        logger.debug(f"✅ Saldo encontrado em sig_type={sig}: ${bal:.2f}")
+                        logger.info(f"💰 Saldo CLOB (sig_type={sig}): ${bal:.2f}")
                         return bal
-                except Exception as e:
-                    logger.debug(f"sig_type={sig} falhou: {e}")
-                    continue
+                except:
+                    pass
+                    
             return 0.0
+            
         except Exception as e:
             logger.error(f"Erro get_balance: {e}")
             return None
+
+    def get_balance_raw(self, signature_type: int = 2) -> float:
+        """Obtém saldo bruto para um signature_type específico"""
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        try:
+            info = self._client.get_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=signature_type
+                )
+            )
+            return int(info.get("balance", 0)) / 1e6
+        except Exception as e:
+            logger.error(f"Erro get_balance_raw({signature_type}): {e}")
+            return 0.0
 
     def get_orderbook(self, token_id: str):
         """Obtém o order book para um token"""
@@ -435,17 +462,20 @@ class OrderExecutor:
         """
         from py_clob_client.clob_types import OrderArgs, OrderType
         
-        # Verificar saldo antes de comprar
-        current_bal = self.get_balance()
-        logger.info(f"💰 Saldo atual antes da compra: ${current_bal:.2f}")
+        # Verificar saldo antes de comprar - USAR FORÇADO sig_type=2
+        current_bal = self.get_balance_raw(signature_type=2)
+        logger.info(f"💰 Saldo atual antes da compra (sig_type=2): ${current_bal:.2f}")
+        logger.info(f"📊 Ordem: {label} - ${size_usdc:.2f} @ {price:.4f} (${price*100:.1f}¢)")
         
-        if current_bal is not None and current_bal < size_usdc:
+        if current_bal < size_usdc:
             error_msg = f"Saldo CLOB insuficiente: ${current_bal:.2f} < ${size_usdc:.2f}"
             logger.error(error_msg)
             return {
                 "success": False,
                 "error": error_msg,
-                "status": "error"
+                "status": "error",
+                "current_balance": current_bal,
+                "required": size_usdc
             }
 
         # Calcular shares
@@ -462,6 +492,7 @@ class OrderExecutor:
             return {"success": False, "error": error_msg, "status": "error"}
 
         try:
+            logger.info(f"📝 Criando ordem: {shares} shares @ {price:.4f}")
             order_args = OrderArgs(
                 price=round(price, 4),
                 size=shares,
@@ -469,6 +500,8 @@ class OrderExecutor:
                 token_id=token_id
             )
             signed = self._client.create_order(order_args)
+            logger.info(f"✍️ Ordem assinada, enviando para CLOB...")
+            
             response = self._client.post_order(signed, otype)
 
             order_id = response.get("orderID") or response.get("id") or "?"
@@ -476,7 +509,8 @@ class OrderExecutor:
             success = response.get("success", False) and status in ("matched", "live", "delayed")
 
             if success:
-                logger.info(f"✅ Ordem enviada: {label} - ${size_usdc:.2f} @ {price:.4f} - Status: {status}")
+                logger.info(f"✅ Ordem enviada com sucesso: {label} - ${size_usdc:.2f} @ {price:.4f} - Status: {status}")
+                logger.info(f"   Order ID: {order_id}")
             else:
                 logger.warning(f"⚠️ Ordem falhou: {label} - {response}")
 
@@ -488,12 +522,15 @@ class OrderExecutor:
                 "size_usdc": size_usdc,
                 "shares": shares,
                 "label": label,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "response": response
             }
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Buy falhou: {error_msg}")
+            logger.error(f"❌ Buy falhou: {error_msg}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": error_msg, "status": "error"}
 
     def sell(self, token_id: str, price: float, shares: float, label: str = "") -> dict:
@@ -512,6 +549,7 @@ class OrderExecutor:
         from py_clob_client.clob_types import OrderArgs, OrderType
         
         try:
+            logger.info(f"📝 Criando ordem de venda: {shares} shares @ {price:.4f}")
             order_args = OrderArgs(
                 price=round(price, 4),
                 size=shares,
