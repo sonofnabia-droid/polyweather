@@ -1,5 +1,5 @@
 """
-munich_config.py
+munich_config.py - BRANCH - INTEGRATION
 ================
 Constantes globais, helpers de timezone, ANSI e janelas de sinal WU.
 """
