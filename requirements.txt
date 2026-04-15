@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════
 #  Munich Max Temp — Live Bot V4
-#  Python >= 3.10 required (for X | Y type hints)
+#  Python >= 3.10 required (for X | Y type hints)  -- BRANCH - INTEGATION
 # ══════════════════════════════════════════════════════
 
 # ── Data & Math ──────────────────────────────────────
