@@ -1,7 +1,7 @@
 """
 tg.py — Telegram notifier para o munich_live_bot.
-Suporta estratégia de 3 Fases com Dupla Condição.
-"""
+Suporta estratégia de 3 Fases com Dupla Condição. BRANCH: sonofnabia-droid-zai
+""" 
 
 import os
 import requests
