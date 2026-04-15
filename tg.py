@@ -1,5 +1,5 @@
 """
-tg.py — Telegram notifier para o munich_live_bot.
+tg.py — Telegram notifier para o munich_live_bot. BRANCH: main
 """
 
 import os
