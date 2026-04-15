@@ -3,21 +3,8 @@ polymarket_orders.py
 ====================
 Execução de ordens no Polymarket CLOB.
 
-Baseado no padrão testado e funcional:
-    client = ClobClient(host=..., key=PRIVATE_KEY, chain_id=137)
-    client.set_api_creds(client.create_or_derive_api_creds())
-    signed = client.create_order(OrderArgs(...))
-    resp   = client.post_order(signed, OrderType.GTC)
-
 Variáveis de ambiente:
     POLY_PRIVATE_KEY=0x...
-
-Uso:
-    from polymarket_orders import OrderExecutor
-    ex = OrderExecutor(private_key)
-    result = ex.buy(token_id, price=0.35, size_usdc=20.0)
-    balance = ex.get_balance()
-    positions = ex.get_open_orders()
 """
 
 from __future__ import annotations
@@ -25,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -36,11 +22,120 @@ CLOB_HOST  = "https://clob.polymarket.com"
 CHAIN_ID   = 137
 CREDS_FILE = Path("live_bot_logs/poly_creds.json")
 
+# Contratos Polymarket na Polygon
+USDC_ADDRESS     = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC (PoS)
+# CTF Exchange — contrato que precisa de allowance para ordens CLOB
+EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+# Approve amount: 1 bilhão USDC (6 decimais) — aprovação permanente
+APPROVE_AMOUNT   = 1_000_000_000 * 10**6
+
+POLYGON_RPCS = [
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+    "https://1rpc.io/matic",
+]
+
+
+def _approve_usdc_onchain(private_key: str) -> bool:
+    """
+    Envia transação approve() onchain no contrato USDC da Polygon.
+    Permite ao Exchange do Polymarket mover USDC da wallet.
+    Só é necessário UMA VEZ por wallet.
+    """
+    from web3 import Web3
+    from eth_account import Account
+
+    ABI_APPROVE = [{
+        "name": "approve",
+        "type": "function",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount",  "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+    }]
+
+    account  = Account.from_key(private_key)
+    spender  = Web3.to_checksum_address(EXCHANGE_ADDRESS)
+    usdc     = Web3.to_checksum_address(USDC_ADDRESS)
+
+    for rpc in POLYGON_RPCS:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+            if not w3.is_connected():
+                logger.debug("RPC %s não conectado", rpc)
+                continue
+
+            contract = w3.eth.contract(address=usdc, abi=ABI_APPROVE)
+            nonce    = w3.eth.get_transaction_count(account.address)
+
+            tx = contract.functions.approve(spender, APPROVE_AMOUNT).build_transaction({
+                "from":     account.address,
+                "nonce":    nonce,
+                "gas":      100_000,
+                "gasPrice": w3.eth.gas_price,
+                "chainId":  137,
+            })
+
+            signed  = w3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            logger.info("Approve tx enviada: %s", tx_hash.hex())
+
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            if receipt.status == 1:
+                logger.info("✓ Approve confirmado onchain (bloco %s)", receipt.blockNumber)
+                return True
+            else:
+                logger.error("✗ Approve falhou onchain (status=0)")
+                return False
+
+        except Exception as e:
+            logger.debug("RPC %s falhou: %s", rpc, e)
+            continue
+
+    logger.error("_approve_usdc_onchain: todos os RPCs falharam")
+    return False
+
+
+def _check_allowance_web3(private_key: str) -> float:
+    """Lê a allowance actual onchain (sem depender do CLOB API)."""
+    from web3 import Web3
+    from eth_account import Account
+
+    ABI_ALLOWANCE = [{
+        "name": "allowance",
+        "type": "function",
+        "inputs": [
+            {"name": "owner",   "type": "address"},
+            {"name": "spender", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    }]
+
+    account = Account.from_key(private_key)
+    owner   = Web3.to_checksum_address(account.address)
+    spender = Web3.to_checksum_address(EXCHANGE_ADDRESS)
+    usdc    = Web3.to_checksum_address(USDC_ADDRESS)
+
+    for rpc in POLYGON_RPCS:
+        try:
+            w3       = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+            contract = w3.eth.contract(address=usdc, abi=ABI_ALLOWANCE)
+            raw      = contract.functions.allowance(owner, spender).call()
+            return raw / 1e6
+        except Exception as e:
+            logger.debug("allowance RPC %s falhou: %s", rpc, e)
+            continue
+
+    return -1.0  # desconhecido
+
 
 class OrderExecutor:
     """
     Executa ordens no Polymarket CLOB.
-    Padrão: create_or_derive_api_creds() sem signature_type nem funder.
+    Verifica e garante allowance onchain antes de qualquer ordem.
     """
 
     def __init__(self, private_key: str):
@@ -53,7 +148,6 @@ class OrderExecutor:
 
     def _init_client(self):
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
         client = ClobClient(
             host     = CLOB_HOST,
@@ -65,7 +159,7 @@ class OrderExecutor:
         CREDS_FILE.parent.mkdir(exist_ok=True)
         if CREDS_FILE.exists():
             try:
-                from py_clob_client.clob_types import ApiCreds
+                from py_clob_client.clob_types import ApiCreds, OpenOrderParams
                 saved = json.loads(CREDS_FILE.read_text())
                 creds = ApiCreds(
                     api_key        = saved["api_key"],
@@ -73,14 +167,11 @@ class OrderExecutor:
                     api_passphrase = saved["api_passphrase"],
                 )
                 client.set_api_creds(creds)
-                # get_ok() é público e não detecta 401 — usar endpoint autenticado
-                from py_clob_client.clob_types import OpenOrderParams
                 client.get_orders(OpenOrderParams())
                 logger.debug("Credenciais carregadas de %s", CREDS_FILE)
             except Exception as e:
-                logger.debug("Creds inválidas ou expiradas (%s) — a re-derivar", e)
+                logger.debug("Creds inválidas (%s) — a re-derivar", e)
                 CREDS_FILE.unlink(missing_ok=True)
-                # Derivar e guardar novas credenciais
                 creds = client.create_or_derive_api_creds()
                 client.set_api_creds(creds)
                 CREDS_FILE.write_text(json.dumps({
@@ -90,7 +181,6 @@ class OrderExecutor:
                 }, indent=2))
                 logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
         else:
-            # Derivar e guardar
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
             CREDS_FILE.write_text(json.dumps({
@@ -100,53 +190,32 @@ class OrderExecutor:
             }, indent=2))
             logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
 
-        # ── NOVO: verificar allowance e aprovar se necessário ──────────────
-        # O erro "balance: 0" no CLOB não é o saldo USDC da wallet — é a
-        # allowance onchain. Sem approve(), o Exchange não pode mover os USDC.
+        # ── Garantir allowance onchain ─────────────────────────────────────
+        # O erro "balance: 0" no CLOB significa allowance onchain = 0.
+        # Verificamos directamente no contrato USDC via Web3 (mais fiável que a API).
         try:
-            info = client.get_balance_allowance(
-                params=BalanceAllowanceParams(
-                    asset_type     = AssetType.COLLATERAL,
-                    signature_type = 2,
-                )
-            )
-            allowance = int(info.get("allowance", "0")) / 1e6
-            balance   = int(info.get("balance",   "0")) / 1e6
-            logger.debug(
-                "CLOB sig_type=2 — balance: %.2f USDC  allowance: %.2f USDC",
-                balance, allowance,
-            )
-
-            if allowance < 1.0:
+            allowance = _check_allowance_web3(self._key)
+            if allowance < 0:
+                logger.warning("Não foi possível verificar allowance — a continuar na mesma")
+            elif allowance < 1.0:
                 logger.info(
-                    "Allowance insuficiente (%.2f USDC) — a enviar approve()...",
+                    "Allowance onchain insuficiente (%.2f USDC) — a enviar approve()...",
                     allowance,
                 )
-                client.update_balance_allowance(
-                    params=BalanceAllowanceParams(
-                        asset_type     = AssetType.COLLATERAL,
-                        signature_type = 2,
+                ok = _approve_usdc_onchain(self._key)
+                if ok:
+                    time.sleep(5)  # aguardar propagação
+                    new_allowance = _check_allowance_web3(self._key)
+                    logger.info("Allowance após approve: %.2f USDC", new_allowance)
+                else:
+                    logger.error(
+                        "APPROVE FALHOU — as ordens reais vão falhar com 'balance: 0'. "
+                        "Verifica se tens MATIC na wallet para gas."
                     )
-                )
-                logger.info("Approval enviado — a aguardar confirmação onchain (5s)...")
-                time.sleep(5)
-
-                # Verificar novamente após approve
-                info2     = client.get_balance_allowance(
-                    params=BalanceAllowanceParams(
-                        asset_type     = AssetType.COLLATERAL,
-                        signature_type = 2,
-                    )
-                )
-                allowance2 = int(info2.get("allowance", "0")) / 1e6
-                logger.info("Allowance após approve: %.2f USDC", allowance2)
             else:
-                logger.debug("Allowance OK (%.2f USDC) — sem necessidade de approve", allowance)
-
+                logger.debug("Allowance onchain OK: %.2f USDC", allowance)
         except Exception as e:
-            logger.warning(
-                "Verificação de allowance falhou: %s — a tentar continuar mesmo assim", e
-            )
+            logger.warning("Verificação de allowance falhou: %s", e)
 
         return client
 
@@ -155,7 +224,6 @@ class OrderExecutor:
     def get_balance(self) -> float | None:
         """
         Saldo USDC disponivel — le sig_type 0,1,2 e devolve o maior.
-        O saldo util para ordens esta tipicamente em sig_type=2.
         """
         try:
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
@@ -177,24 +245,22 @@ class OrderExecutor:
         except Exception as e:
             logger.debug("get_balance_allowance falhou: %s", e)
 
-        # Fallback para Web3 se o método acima falhar
-        RPC_LIST = [
-            "https://rpc.ankr.com/polygon",
-            "https://polygon.llamarpc.com",
-            "https://1rpc.io/matic",
-        ]
-        for rpc in RPC_LIST:
+        # Fallback Web3
+        for rpc in POLYGON_RPCS:
             try:
                 from web3 import Web3
                 from eth_account import Account
-                USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-                ABI  = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],
-                         "name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],
-                         "type":"function"}]
+                ABI = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],
+                        "name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],
+                        "type":"function"}]
                 w3       = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
                 addr     = Account.from_key(self._key).address
-                contract = w3.eth.contract(address=Web3.to_checksum_address(USDC), abi=ABI)
-                bal      = contract.functions.balanceOf(Web3.to_checksum_address(addr)).call()
+                contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(USDC_ADDRESS), abi=ABI
+                )
+                bal = contract.functions.balanceOf(
+                    Web3.to_checksum_address(addr)
+                ).call()
                 return round(bal / 1_000_000.0, 2)
             except Exception as e:
                 logger.debug("Web3 RPC %s falhou: %s", rpc, e)
@@ -227,7 +293,6 @@ class OrderExecutor:
     # ── Ordens abertas ─────────────────────────────────
 
     def get_open_orders(self) -> list[dict]:
-        """Lista de ordens abertas (não preenchidas) no CLOB."""
         try:
             from py_clob_client.clob_types import OpenOrderParams
             orders = self._client.get_orders(OpenOrderParams())
@@ -241,25 +306,14 @@ class OrderExecutor:
     def buy(
         self,
         token_id:   str,
-        price:      float,      # preço limite 0–1, tipicamente o ask
-        size_usdc:  float,      # USDC a gastar
-        label:      str  = "",  # para logging
-        order_type: str  = "FOK",  # "FOK" = market order, "GTC" = limit order
+        price:      float,
+        size_usdc:  float,
+        label:      str = "",
+        order_type: str = "FOK",
     ) -> dict:
-        """
-        Comprar YES num bracket.
-        Devolve dict com success, order_id, status, error.
-
-        order_type="FOK" (default): Fill-or-Kill ao ask.
-            shares = floor(size/price) → makerAmount sempre com ≤ 2 casas decimais.
-            Preenche imediatamente ou cancela — comportamento de market order.
-        order_type="GTC": Good-Till-Cancelled.
-            shares = round(size/price, 4) → fica no book se não encher.
-        """
         from py_clob_client.clob_types import OrderArgs, OrderType
 
         if order_type.upper() == "FOK":
-            # floor garante shares inteiro → shares×price nunca excede 2 casas decimais
             shares = math.floor(size_usdc / price)
             _otype = OrderType.FOK
         else:
@@ -327,7 +381,6 @@ class OrderExecutor:
         shares:   float,
         label:    str = "",
     ) -> dict:
-        """Vender shares YES (fechar posição). Usa GTC ao bid."""
         from py_clob_client.clob_types import OrderArgs, OrderType
 
         try:
@@ -378,10 +431,9 @@ class OrderExecutor:
         self._log(result)
         return result
 
-    # ── Cancelar ordem ─────────────────────────────────
+    # ── Cancelar ───────────────────────────────────────
 
     def cancel(self, order_id: str) -> bool:
-        """Cancelar uma ordem aberta pelo ID."""
         try:
             self._client.cancel(order_id)
             return True
@@ -390,7 +442,6 @@ class OrderExecutor:
             return False
 
     def cancel_all(self) -> bool:
-        """Cancelar todas as ordens abertas de uma vez."""
         try:
             self._client.cancel_all()
             return True
@@ -420,11 +471,10 @@ def _today() -> str:
     return date.today().isoformat()
 
 
-# ── Paper simulation (sem rede) ───────────────────────
+# ── Paper simulation ──────────────────────────────────
 
 def paper_buy(token_id: str, price: float, size_usdc: float,
               label: str = "") -> dict:
-    """Simula uma compra sem enviar nada ao CLOB."""
     shares = round(size_usdc / price, 2)
     result = {
         "success":   True,
