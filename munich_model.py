@@ -1,5 +1,5 @@
 """
-munich_model.py
+munich_model.py  - BRANCH - INTEGRATION
 ===============
 Carregamento de modelos (LightGBM + XGBoost), construção de features
 V1 canónicas, predição ensemble com predict_proba(), z-score streaming,
