@@ -1,5 +1,5 @@
 """
-munich_live_bot.py
+munich_live_bot.py BRANCH - main
 ==================
 Bot de trading ao vivo — Temperatura Maxima Munich — Polymarket.
 
