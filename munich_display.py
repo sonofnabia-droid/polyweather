@@ -1,5 +1,6 @@
 # munich_display.py — versão com risk-first, barra adaptativa,
 # risk_used, risk_remaining, risk_per_trade, sem Kelly, e TRACKER DE 3 FASES. - BRANCH - sonofnabia-droid-zai
+# BRANCH - sonofnabia-droid-zai
 
 import csv
 import os
