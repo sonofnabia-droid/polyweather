@@ -1,5 +1,5 @@
 """
-munich_model.py
+munich_model.py - BRANCH - main
 ===============
 Carregamento do modelo LightGBM, construcao de features, predicao e
 gestao do historico diario de maximas.
