@@ -1,5 +1,5 @@
 """
-munich_backtester.py
+munich_backtester.py  # BRANCH - INTEGRATION
 ====================
 Backtest V3: Ensemble (LGBM + XGB + Z-Score) + Phased(3) ou Single(1).
 
