@@ -53,6 +53,7 @@ class OrderExecutor:
 
     def _init_client(self):
         from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
         client = ClobClient(
             host     = CLOB_HOST,
@@ -76,20 +77,77 @@ class OrderExecutor:
                 from py_clob_client.clob_types import OpenOrderParams
                 client.get_orders(OpenOrderParams())
                 logger.debug("Credenciais carregadas de %s", CREDS_FILE)
-                return client
             except Exception as e:
                 logger.debug("Creds inválidas ou expiradas (%s) — a re-derivar", e)
                 CREDS_FILE.unlink(missing_ok=True)
+                # Derivar e guardar novas credenciais
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+                CREDS_FILE.write_text(json.dumps({
+                    "api_key":        creds.api_key,
+                    "api_secret":     creds.api_secret,
+                    "api_passphrase": creds.api_passphrase,
+                }, indent=2))
+                logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
+        else:
+            # Derivar e guardar
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+            CREDS_FILE.write_text(json.dumps({
+                "api_key":        creds.api_key,
+                "api_secret":     creds.api_secret,
+                "api_passphrase": creds.api_passphrase,
+            }, indent=2))
+            logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
 
-        # Derivar e guardar
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        CREDS_FILE.write_text(json.dumps({
-            "api_key":        creds.api_key,
-            "api_secret":     creds.api_secret,
-            "api_passphrase": creds.api_passphrase,
-        }, indent=2))
-        logger.info("Credenciais derivadas e guardadas em %s", CREDS_FILE)
+        # ── NOVO: verificar allowance e aprovar se necessário ──────────────
+        # O erro "balance: 0" no CLOB não é o saldo USDC da wallet — é a
+        # allowance onchain. Sem approve(), o Exchange não pode mover os USDC.
+        try:
+            info = client.get_balance_allowance(
+                params=BalanceAllowanceParams(
+                    asset_type     = AssetType.COLLATERAL,
+                    signature_type = 2,
+                )
+            )
+            allowance = int(info.get("allowance", "0")) / 1e6
+            balance   = int(info.get("balance",   "0")) / 1e6
+            logger.debug(
+                "CLOB sig_type=2 — balance: %.2f USDC  allowance: %.2f USDC",
+                balance, allowance,
+            )
+
+            if allowance < 1.0:
+                logger.info(
+                    "Allowance insuficiente (%.2f USDC) — a enviar approve()...",
+                    allowance,
+                )
+                client.update_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type     = AssetType.COLLATERAL,
+                        signature_type = 2,
+                    )
+                )
+                logger.info("Approval enviado — a aguardar confirmação onchain (5s)...")
+                time.sleep(5)
+
+                # Verificar novamente após approve
+                info2     = client.get_balance_allowance(
+                    params=BalanceAllowanceParams(
+                        asset_type     = AssetType.COLLATERAL,
+                        signature_type = 2,
+                    )
+                )
+                allowance2 = int(info2.get("allowance", "0")) / 1e6
+                logger.info("Allowance após approve: %.2f USDC", allowance2)
+            else:
+                logger.debug("Allowance OK (%.2f USDC) — sem necessidade de approve", allowance)
+
+        except Exception as e:
+            logger.warning(
+                "Verificação de allowance falhou: %s — a tentar continuar mesmo assim", e
+            )
+
         return client
 
     # ── Saldo ──────────────────────────────────────────
