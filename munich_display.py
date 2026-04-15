@@ -1,6 +1,6 @@
 # munich_display.py — versão reescrita com risk-first, barra adaptativa,
 # risk_used, risk_remaining, risk_per_trade, sem Kelly.  - BRANCH - main
-
+# BRANCH - main
 import csv
 import os
 import shutil
