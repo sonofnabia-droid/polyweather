@@ -58,6 +58,7 @@ from polymarket_clob import (
 )
 from polymarket_orders import OrderExecutor, paper_buy
 from tg import TG
+from munich_fuzzy_gatekeeper import FuzzyGatekeeper, create_gatekeeper
 
 # ═════════════════════════════════════════════════════
 #  DATA CLASSES PARA LIVE BOT
@@ -288,6 +289,9 @@ class UnifiedLiveBot:
         self.sl_checker = StopLossChecker(self.config.stop_loss)
         self.position_mgr = PositionManager(self.config.stop_loss)
 
+        # Fuzzy Gatekeeper
+        self.gatekeeper = create_gatekeeper(self.config.get("gatekeeper"))
+
         # Entry strategy
         if self.config.entry.mode == "phased":
             self.entry = PhasedEntry(parcel_size=self.config.entry.phased_parcel_size)
@@ -487,6 +491,36 @@ class UnifiedLiveBot:
 
         # Forecast agreement
         fc_agreement = {"valid": np.random.random() < 0.80}  # Placeholder
+
+        # Fuzzy Gatekeeper: verificar contexto antes de entrada
+        # Buscar bracket mais próximo para o ask
+        bracket_for_gatekeeper = self._find_entry_bracket(
+            market["brackets"], running_max, 0
+        )
+        ask_for_gatekeeper = bracket_for_gatekeeper.get("ask", 0.5) if bracket_for_gatekeeper else 0.5
+
+        # Obter componente z-score da predição anterior
+        zscore_component = None  # TODO: obter do predict_ensemble
+
+        # Avaliar com Fuzzy Gatekeeper
+        gatekeeper_result = self.gatekeeper.evaluate(
+            p_ensemble=p_ensemble,
+            ask_price=ask_for_gatekeeper,
+            forecast_agreement=fc_agreement,
+            market=market,
+            zscore_component=zscore_component,
+            running_max=running_max,
+            current_temp=current_temp
+        )
+
+        # Se Gatekeeper bloquear, não continuar
+        if not gatekeeper_result.allowed:
+            print(f"  {C['red']}GATEKEEPER: {gatekeeper_result.reason}{reset}")
+            return
+
+        # Se Gatekeeper permitir mas for RISKY, avisar
+        if gatekeeper_result.state.value == "risky":
+            print(f"  {C['yellow']}GATEKEEPER: {gatekeeper_result.reason}{reset}")
 
         # Avaliar entrada
         actions = self.entry.evaluate(

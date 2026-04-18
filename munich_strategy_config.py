@@ -104,6 +104,30 @@ class PositionConfig:
 
 
 @dataclass
+class GatekeeperConfig:
+    """Configuração do Fuzzy Gatekeeper."""
+
+    # EV mínimo para considerar entrada
+    ev_min_threshold: float = 0.02  # 2% EV mínimo
+
+    # Z-score mínimo para confirmar sinal
+    zscore_min: float = 1.0
+
+    # Volume mínimo do mercado
+    market_volume_min: float = 100.0
+
+    # Pesos para cada condição (soma = 1.0)
+    weight_ev: float = 0.35
+    weight_forecast: float = 0.25
+    weight_market: float = 0.20
+    weight_zscore: float = 0.20
+
+    # Score mínimo para permitir entrada
+    min_safe_score: float = 0.70
+    min_risky_score: float = 0.40
+
+
+@dataclass
 class OptimizationConfig:
     """Configuração para Optuna optimization."""
 
@@ -116,6 +140,8 @@ class OptimizationConfig:
     optimize_single_threshold: bool = True
     optimize_p2_threshold: bool = True
     optimize_p3_threshold: bool = True
+    optimize_gatekeeper_ev: bool = True
+    optimize_gatekeeper_zscore: bool = True
 
     # Ranges para otimização (ajustados para evitar sobreposição)
     temp_threshold_range: tuple = (0.2, 2.0)
@@ -123,6 +149,10 @@ class OptimizationConfig:
     single_threshold_range: tuple = (0.75, 0.95)  # single deve ser maior que p2
     p2_threshold_range: tuple = (0.55, 0.75)     # p2 deve ser menor que single e maior que p3
     p3_threshold_range: tuple = (0.80, 0.95)    # p3 deve ser maior que p2 (para phased entry)
+
+    # Ranges para otimização do Gatekeeper
+    gatekeeper_ev_range: tuple = (0.01, 0.10)  # 1% a 10% EV mínimo
+    gatekeeper_zscore_range: tuple = (0.5, 2.0)  # Z-score mínimo
 
     # Função objetivo: maximize (1) ROI, (2) Sharpe, (3) custom_score
     objective: str = "custom_score"  # "roi", "sharpe", "custom_score"
@@ -141,6 +171,7 @@ class StrategyConfig:
     stop_loss: StopLossConfig = field(default_factory=StopLossConfig)
     entry: EntryConfig = field(default_factory=EntryConfig)
     position: PositionConfig = field(default_factory=PositionConfig)
+    gatekeeper: GatekeeperConfig = field(default_factory=GatekeeperConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
 
     # Metadados

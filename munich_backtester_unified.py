@@ -59,6 +59,7 @@ from munich_strategy_config import (
 )
 from munich_stop_loss import Position, StopLossChecker, PositionManager
 from munich_phased_entry import PhasedEntry, SingleEntry
+from munich_fuzzy_gatekeeper import FuzzyGatekeeper, create_gatekeeper
 
 warnings.filterwarnings("ignore")
 optuna_logging = logging.getLogger("optuna")
@@ -290,6 +291,9 @@ class UnifiedBacktester:
         # Stop-loss checker
         self.sl_checker = StopLossChecker(self.config.stop_loss)
 
+        # Fuzzy Gatekeeper
+        self.gatekeeper = create_gatekeeper(self.config.get("gatekeeper"))
+
         # Estado do backtest
         self.trades: List[Trade] = []
         self.daily_results: List[DailyResult] = []
@@ -515,10 +519,35 @@ class UnifiedBacktester:
                 if not position_mgr.get_active_positions():
                     # Gerar mercado simulado
                     brackets = self.market.get_brackets(p_ensemble, running_max, h)
-                    market_sim = {"brackets": brackets}
+                    market_sim = {"brackets": brackets, "volume": np.random.uniform(100, 5000)}
 
                     # Forecast agreement (simulado)
                     fc_agreement = {"valid": np.random.random() < 0.80}
+
+                    # Fuzzy Gatekeeper: verificar contexto antes de entrada
+                    # Buscar bracket mais próximo para o ask
+                    bracket_for_gatekeeper = self._find_entry_bracket(
+                        brackets, running_max, 0
+                    )
+                    ask_for_gatekeeper = bracket_for_gatekeeper.get("ask", 0.5) if bracket_for_gatekeeper else 0.5
+
+                    # Obter componente z-score da predição
+                    zscore_component = pred.get("p_zscore")
+
+                    # Avaliar com Fuzzy Gatekeeper
+                    gatekeeper_result = self.gatekeeper.evaluate(
+                        p_ensemble=p_ensemble,
+                        ask_price=ask_for_gatekeeper,
+                        forecast_agreement=fc_agreement,
+                        market=market_sim,
+                        zscore_component=zscore_component,
+                        running_max=running_max,
+                        current_temp=t
+                    )
+
+                    # Se Gatekeeper bloquear, não continuar
+                    if not gatekeeper_result.allowed:
+                        continue
 
                     # Avaliar entrada
                     actions = entry.evaluate(
