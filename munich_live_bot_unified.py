@@ -290,7 +290,7 @@ class UnifiedLiveBot:
         self.position_mgr = PositionManager(self.config.stop_loss)
 
         # Fuzzy Gatekeeper
-        self.gatekeeper = create_gatekeeper(self.config.get("gatekeeper"))
+        self.gatekeeper = create_gatekeeper(self.config.gatekeeper)
 
         # Entry strategy
         if self.config.entry.mode == "phased":

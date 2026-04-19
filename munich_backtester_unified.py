@@ -292,7 +292,7 @@ class UnifiedBacktester:
         self.sl_checker = StopLossChecker(self.config.stop_loss)
 
         # Fuzzy Gatekeeper
-        self.gatekeeper = create_gatekeeper(self.config.get("gatekeeper"))
+        self.gatekeeper = create_gatekeeper(self.config.gatekeeper)
 
         # Estado do backtest
         self.trades: List[Trade] = []

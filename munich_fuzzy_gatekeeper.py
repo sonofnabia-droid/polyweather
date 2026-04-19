@@ -15,7 +15,7 @@ Lógica fuzzy para avaliação de risco (estados possíveis):
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 from enum import Enum
 
 
@@ -262,17 +262,31 @@ class FuzzyGatekeeper:
 #  FUNÇÕES DE CONVENIÊNCIA
 # ═════════════════════════════════════════════════════
 
-def create_gatekeeper(config: Optional[Dict] = None) -> FuzzyGatekeeper:
+def create_gatekeeper(config: Optional[Dict | Any] = None) -> FuzzyGatekeeper:
     """
     Cria um FuzzyGatekeeper com configuração.
 
     Args:
-        config: Dict com configurações personalizadas
+        config: Dict ou GatekeeperConfig com configurações personalizadas
 
     Returns:
         FuzzyGatekeeper configurado
     """
     if config:
+        # Check se é uma dataclass (GatekeeperConfig)
+        if hasattr(config, '__dataclass_fields__'):
+            return FuzzyGatekeeper(
+                ev_min_threshold=config.ev_min_threshold,
+                zscore_min=config.zscore_min,
+                market_volume_min=config.market_volume_min,
+                weights={
+                    "ev": config.weight_ev,
+                    "forecast": config.weight_forecast,
+                    "market": config.weight_market,
+                    "zscore": config.weight_zscore,
+                }
+            )
+        # Caso contrário, assume que é um Dict
         return FuzzyGatekeeper(
             ev_min_threshold=config.get("ev_min_threshold", 0.02),
             zscore_min=config.get("zscore_min", 1.0),
